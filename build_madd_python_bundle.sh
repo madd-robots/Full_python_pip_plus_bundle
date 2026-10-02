@@ -18,6 +18,7 @@ DISTRO=ubuntu-claude-secure
 OUTPUT_DIR="$PROJECT_DIR/output"
 PROFILE=mx25-amd64
 MIN_FREE_GB=4
+TARGET_STATE=""
 PASS_ARGS=()
 
 usage() {
@@ -30,9 +31,12 @@ Usage: ./build_madd_python_bundle.sh [options]
   --output DIR                 output directory (default: ./output)
   --profile ID                 target profile in builder/profiles (default: $PROFILE)
   --min-free-gb N              required free space in GiB (default: $MIN_FREE_GB)
+  --target-state DIR           resolve against a state directory exported on the
+                               MX machine by export-target-state.sh (recommended)
   --install-staging-prereqs    apt-get install the staging tools inside the
                                staging environment (never on the target)
   --keep-staging               keep the staging directory if the build fails
+  --skip-baseline-model        do not model un-updated MX 25 / Debian 13.0 targets
   -h, --help                   this help
 EOF
 }
@@ -44,7 +48,8 @@ while [ "$#" -gt 0 ]; do
         --output) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; OUTPUT_DIR=$2; shift ;;
         --profile) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; PROFILE=$2; shift ;;
         --min-free-gb) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; MIN_FREE_GB=$2; shift ;;
-        --install-staging-prereqs|--keep-staging) PASS_ARGS+=("$1") ;;
+        --target-state) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; TARGET_STATE=$2; shift ;;
+        --install-staging-prereqs|--keep-staging|--skip-baseline-model) PASS_ARGS+=("$1") ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -89,31 +94,52 @@ say "free space at $OUTPUT_DIR: $((avail_kb / 1024)) MiB (required $((need_kb / 
 [ "$avail_kb" -ge "$need_kb" ] || die "insufficient storage: free at least ${MIN_FREE_GB} GiB or use --output on a larger volume"
 
 STAGE_ARGS=(--profile "$PROFILE" --min-free-gb "$MIN_FREE_GB" "${PASS_ARGS[@]}")
+if [ -n "$TARGET_STATE" ]; then
+    [ -f "$TARGET_STATE/status" ] || die "--target-state $TARGET_STATE has no status file (see export-target-state.sh)"
+    TARGET_STATE=$(cd -- "$TARGET_STATE" && pwd -P)
+    if [ -f "$TARGET_STATE/SHA256SUMS" ]; then
+        ( cd -- "$TARGET_STATE" && sha256sum --check --strict --quiet SHA256SUMS ) || die "target state checksum mismatch"
+    fi
+    say "target state: $TARGET_STATE (exported $(cat -- "$TARGET_STATE/exported-utc" 2>/dev/null || printf 'unknown'))"
+else
+    say "no --target-state given: generic MX 25 / Debian 13 resolution"
+fi
 
 case "$STAGING" in
     proot)
         [ "$IS_TERMUX" -eq 1 ] || die "--staging proot is only supported from Termux"
         command -v proot-distro >/dev/null 2>&1 || die "proot-distro not found (pkg install proot-distro)"
-        ROOTFS="${PREFIX:-/data/data/com.termux/files/usr}/var/lib/proot-distro/installed-rootfs/$DISTRO"
-        if [ ! -d "$ROOTFS" ]; then
+        # proot-distro 4.x: installed-rootfs/NAME; 5.x: containers/NAME/rootfs.
+        PD_DIR="${PREFIX:-/data/data/com.termux/files/usr}/var/lib/proot-distro"
+        if [ -d "$PD_DIR/installed-rootfs/$DISTRO" ]; then
+            say "found $DISTRO at $PD_DIR/installed-rootfs/$DISTRO"
+        elif [ -d "$PD_DIR/containers/$DISTRO/rootfs" ]; then
+            say "found $DISTRO at $PD_DIR/containers/$DISTRO/rootfs"
+        else
+            say "rootfs of '$DISTRO' not found in the usual locations; trying to log in anyway"
+        fi
+        if ! proot-distro login "$DISTRO" -- /bin/true; then
             say "installed proot-distro environments:"
             proot-distro list 2>&1 | sed 's/^/    /' || true
-            die "proot-distro environment '$DISTRO' not found at $ROOTFS"
+            die "cannot start proot-distro environment '$DISTRO'"
         fi
         say "using existing proot-distro environment: $DISTRO"
-        proot-distro login "$DISTRO" -- /bin/true || die "cannot start '$DISTRO' (proot-distro login failed)"
         STAGING_OS=$(proot-distro login "$DISTRO" -- /bin/sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')
         say "staging OS: ${STAGING_OS:-unknown}"
         MNT_PROJECT=/mnt/madd-python-project
         MNT_OUTPUT=/mnt/madd-python-output
-        proot-distro login "$DISTRO" \
-            --bind "$PROJECT_DIR:$MNT_PROJECT" \
-            --bind "$OUTPUT_DIR:$MNT_OUTPUT" \
+        BINDS=(--bind "$PROJECT_DIR:$MNT_PROJECT" --bind "$OUTPUT_DIR:$MNT_OUTPUT")
+        if [ -n "$TARGET_STATE" ]; then
+            BINDS+=(--bind "$TARGET_STATE:/mnt/madd-python-target-state")
+            STAGE_ARGS+=(--target-state /mnt/madd-python-target-state)
+        fi
+        proot-distro login "$DISTRO" "${BINDS[@]}" \
             -- /usr/bin/env MADD_STAGING_LABEL="proot-distro $DISTRO on $HOST_ARCH" \
             /bin/bash "$MNT_PROJECT/builder/stage.sh" --output "$MNT_OUTPUT" "${STAGE_ARGS[@]}"
         ;;
     local)
         [ "$IS_TERMUX" -eq 0 ] || die "Termux itself is not a valid staging environment; use --staging proot"
+        [ -z "$TARGET_STATE" ] || STAGE_ARGS+=(--target-state "$TARGET_STATE")
         MADD_STAGING_LABEL="local host $HOST_ARCH" \
             bash "$PROJECT_DIR/builder/stage.sh" --output "$OUTPUT_DIR" "${STAGE_ARGS[@]}"
         ;;

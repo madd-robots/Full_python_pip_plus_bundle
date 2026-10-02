@@ -64,7 +64,7 @@ die() { printf '[%s] STOP: %s\n' "$PROG" "$*" >&2; exit 1; }
 section() { printf '\n==== %s ====\n' "$*"; }
 
 on_error() {
-    printf '[%s] STOP: unexpected failure at line %s (exit %s). Nothing further was changed.\n' \
+    printf '[%s] STOP: unexpected failure at line %s (exit %s); no further steps were run.\n' \
         "$PROG" "$1" "$2" >&2
 }
 trap 'on_error "$LINENO" "$?"' ERR
@@ -196,7 +196,8 @@ as_user() {
         PATH=/usr/local/bin:/usr/bin:/bin LC_ALL=C.UTF-8 LANG=C.UTF-8
         http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9
         HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 no_proxy= NO_PROXY=
-        PIP_CONFIG_FILE=/dev/null PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONNOUSERSITE=1)
+        PIP_CONFIG_FILE=/dev/null PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONNOUSERSITE=1
+        PYTHONDONTWRITEBYTECODE=1)
     local v
     for v in DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR; do
         [ -z "${!v:-}" ] || envv+=("$v=${!v}")
@@ -315,10 +316,8 @@ EOF
     info "local repository: $(grep -c '^Package: ' "$REPO/Packages") packages indexed, no network sources configured"
 
     section "Preflight: dependency resolution simulation (no changes)"
-    set +e
-    apt_local -s -q --no-install-recommends --no-remove install "${DEB_PKGS[@]}" >"$WORK/sim.log" 2>&1
-    sim_rc=$?
-    set -e
+    sim_rc=0
+    apt_local -s -q --no-install-recommends --no-remove install "${DEB_PKGS[@]}" >"$WORK/sim.log" 2>&1 || sim_rc=$?
     if [ "$sim_rc" -ne 0 ]; then
         sed -n '1,80p' "$WORK/sim.log" >&2
         die "dependency resolution failed: required packages or versions are missing from the bundle (see above). No changes were made. Rebuild the bundle against current Debian $WANT_CODENAME updates."
@@ -433,9 +432,9 @@ if [ "$NO_LAUNCHERS" -eq 0 ] && [ -x "$BIN_DIR/madd-python" ]; then
 fi
 as_user "$VENV/bin/python" -m pip --version || SMOKE_FAIL=1
 info "system python3 standard-library checks:"
-as_user /usr/bin/python3 "$BUNDLE_DIR/scripts/verify_python.py" || SMOKE_FAIL=1
+as_user /usr/bin/python3 -B "$BUNDLE_DIR/scripts/verify_python.py" || SMOKE_FAIL=1
 info "environment checks:"
-as_user "$VENV/bin/python" "$BUNDLE_DIR/scripts/smoke_test.py" || SMOKE_FAIL=1
+as_user "$VENV/bin/python" -B "$BUNDLE_DIR/scripts/smoke_test.py" || SMOKE_FAIL=1
 
 section "Summary"
 info "system packages: installed from offline bundle ($PROFILE_MATCH)"

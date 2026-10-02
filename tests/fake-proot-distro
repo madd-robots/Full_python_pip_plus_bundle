@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Test fixture: minimal stand-in for Termux's proot-distro, backed by real proot,
+# so build_madd_python_bundle.sh's Termux path can be exercised on a Linux test
+# host. Supports only what the builder uses:
+#   fake-proot-distro list
+#   fake-proot-distro login NAME [--bind SRC:DST]... -- CMD [ARG]...
+# PROOT selects the proot binary (use a Termux proot build; Ubuntu's proot 5.1.0
+# lacks faccessat2 support, which breaks apt-key's keyring check).
+# Rootfs: $PREFIX/var/lib/proot-distro/containers/NAME/rootfs (5.x layout).
+# Test-host plumbing: the host CA bundle, resolv.conf and proxy variables are
+# passed through so the sandboxed test host can reach its network proxy.
+set -Eeuo pipefail
+
+PD_DIR="${PREFIX:?PREFIX must be set}/var/lib/proot-distro/containers"
+
+case "${1:-}" in
+    list)
+        find "$PD_DIR" -mindepth 1 -maxdepth 1 -printf '  %f\n'
+        exit 0 ;;
+    login) shift ;;
+    *) printf 'fake-proot-distro: unsupported command %s\n' "${1:-}" >&2; exit 2 ;;
+esac
+
+NAME=${1:?container name required}
+shift
+ROOTFS="$PD_DIR/$NAME/rootfs"
+[ -d "$ROOTFS" ] || { printf 'fake-proot-distro: no container %s\n' "$NAME" >&2; exit 1; }
+
+BINDS=(-b /dev -b /proc -b /sys -b /etc/resolv.conf -b /etc/ssl/certs/ca-certificates.crt)
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --bind) BINDS+=(-b "$2"); shift 2 ;;
+        --) shift; break ;;
+        *) printf 'fake-proot-distro: unsupported option %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+[ "$#" -gt 0 ] || set -- /bin/bash -l
+
+ENVV=(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8)
+for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY; do
+    [ -z "${!v:-}" ] || ENVV+=("$v=${!v}")
+done
+exec "${PROOT:-proot}" -0 --link2symlink -r "$ROOTFS" "${BINDS[@]}" -w /root /usr/bin/env -i "${ENVV[@]}" "$@"

@@ -38,7 +38,7 @@ STAGING_MARKER = ".madd-python-staging"
 TOOLS_STAMP = ".madd-tools-stamp"
 PYPI_INDEX = "https://pypi.org/simple"
 
-EXECUTABLE_FILES = {"install.sh", "verify.sh", "uninstall-user-env.sh"}
+EXECUTABLE_FILES = {"install.sh", "verify.sh", "uninstall-user-env.sh", "export-target-state.sh"}
 
 
 class BuildError(Exception):
@@ -218,6 +218,32 @@ class Builder:
         self.results = []  # (test name, PASS/FAIL/SKIP, detail)
         self.build_epoch = int(os.environ.get("SOURCE_DATE_EPOCH") or time.time())
         self.staging = None
+        self.lockstep = []
+        self.target_state = None
+        self.target_state_arg = getattr(args, "target_state", "")
+
+    def load_target_state(self, d):
+        """Validate a directory produced by export-target-state.sh on the target machine."""
+        need = ("status", "dpkg-architecture", "os-release")
+        for n in need:
+            if not (d / n).is_file():
+                raise BuildError("target state %s lacks %s (create it with export-target-state.sh)" % (d, n))
+        arch = (d / "dpkg-architecture").read_text().strip()
+        if arch != self.deb_arch:
+            raise BuildError("target state architecture %r does not match profile %r" % (arch, self.deb_arch))
+        osr = {}
+        for line in (d / "os-release").read_text().splitlines():
+            k, sep, v = line.partition("=")
+            if sep:
+                osr[k] = v.strip().strip('"')
+        if osr.get("VERSION_CODENAME") not in ("", None, self.profile["DEBIAN_CODENAME"]):
+            raise BuildError("target state is %s, profile expects %s" % (osr.get("VERSION_CODENAME"), self.profile["DEBIAN_CODENAME"]))
+        status = (d / "status").read_text(encoding="utf-8", errors="replace")
+        if "Package: dpkg\n" not in status:
+            raise BuildError("target state status file does not look like /var/lib/dpkg/status")
+        log("target state: %s (%d installed-package records, sha256 %s)"
+            % (d, status.count("\nPackage: ") + 1, sha256_file(d / "status")[:16]))
+        return d
 
     # -- bookkeeping -------------------------------------------------------
     def record(self, name, ok, detail=""):
@@ -359,11 +385,31 @@ class Builder:
         run(["apt-get", "update", "-q"], env=env)
 
         self.deb_top = read_list_file(BUILDER_DIR / "debian-packages.txt")
-        sim = run(["apt-get", "-s", "-q", "install", "--no-install-recommends", *self.deb_top],
-                  env=env, capture=True)
-        wanted = self.parse_apt_sim(sim.stdout)
-        log("dependency closure: %d packages" % len(wanted))
-        run(["apt-get", "-q", "-y", "install", "--download-only", "--no-install-recommends", *self.deb_top],
+        self.apt_conf, self.apt_root = conf, apt_root
+        wanted = self.simulate(env, self.deb_top)
+        log("dependency closure (empty system): %d packages" % len(wanted))
+        empty_names = {n for n, _v, _a in wanted}
+        forced = set()
+        if not self.args.skip_baseline_model:
+            for label, status in self.baseline_models(keyring):
+                ops = self.simulate(env, self.deb_top, status=status)
+                forced |= {n for n, _v, _a in ops}
+                log("baseline model %s: %d package operation(s)" % (label, len(ops)))
+        self.lockstep = sorted(forced - empty_names)
+        if self.lockstep:
+            wanted = self.simulate(env, self.deb_top + self.lockstep)
+            log("added %d base package(s) that older target systems must upgrade in lockstep: %s"
+                % (len(self.lockstep), " ".join(self.lockstep)))
+        if self.target_state:
+            tstatus = apt_root / "state" / "target-status"
+            shutil.copyfile(self.target_state / "status", tstatus)
+            tw = self.simulate(env, self.deb_top, status=tstatus)
+            extra = {w for w in tw if w[0] not in {n for n, _v, _a in wanted}}
+            log("target-state resolution: %d package operation(s), %d not already in the bundle"
+                % (len(tw), len(extra)))
+            wanted |= tw
+        names = sorted({n for n, _v, _a in wanted})
+        run(["apt-get", "-q", "-y", "install", "--download-only", "--no-install-recommends", *names],
             env=env)
 
         index = self.load_index(lists)
@@ -424,6 +470,72 @@ class Builder:
         self.glibc = (int(g.group(1)), int(g.group(2)))
         self.python_deb_version = by_name["python%s" % self.py_short]["version"]
         log("target Python: %s (%s), glibc %d.%d" % (self.py_full, self.py_abi, *self.glibc))
+
+    def simulate(self, env, pkgs, status=None):
+        """APT simulation (no changes) -> set of (name, version, arch) to install."""
+        cmd = ["apt-get", "-s", "-q", "install", "--no-install-recommends"]
+        if status is not None:
+            cmd += ["-o", "Dir::State::status=%s" % status]
+        proc = run(cmd + list(pkgs), env=env, capture=True, check=False, quiet=True)
+        if proc.returncode != 0:
+            print(proc.stdout[-4000:], flush=True)
+            raise BuildError("APT could not resolve %s" % ("the target-state system" if status else "the package set"))
+        return self.parse_apt_sim(proc.stdout)
+
+    @staticmethod
+    def relations(text):
+        """Yield (name, op, version) for every alternative in a Debian relation field."""
+        for part in (text or "").split(","):
+            for alt in part.split("|"):
+                m = re.match(r"\s*([a-z0-9][a-z0-9.+-]*)(?::\S+)?\s*(?:\(\s*([<>=]+)\s*([^)\s]+)\s*\))?", alt)
+                if m:
+                    yield m.group(1), m.group(2), m.group(3)
+
+    def baseline_models(self, keyring):
+        """Synthetic dpkg status files describing un-updated MX 25 / Debian 13.0 machines.
+
+        A machine that has not installed later updates holds older versions of
+        packages that pin bundled libraries exactly (e.g. util-linux PreDepends
+        libuuid1 (= version)). APT then has to upgrade those siblings too, so they
+        must be in the bundle. The baseline is built from the signed Debian 13.0
+        release index (snapshot.debian.org) and closed under its dependencies:
+          M1: Essential/required/important/standard + MX-like desktop packages
+          M2: M1 + every bundle package at its 13.0 version (worst case for upgrades)
+        Results are cached per build in self.models for the offline re-check.
+        """
+        p = self.profile
+        snap = p.get("DEBIAN_BASELINE_SNAPSHOT", "")
+        if not snap.startswith("https://"):
+            raise BuildError("profile needs an https DEBIAN_BASELINE_SNAPSHOT (or use --skip-baseline-model)")
+        root = self.staging / "apt-baseline"
+        sources = ("Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nArchitectures: %s\nSigned-By: %s\n"
+                   % (snap, p["DEBIAN_CODENAME"], p["DEBIAN_COMPONENTS"], self.deb_arch, keyring))
+        conf = self.write_apt_config(root, sources, self.cache / ("apt-lists-baseline-%s" % p["PROFILE_ID"]),
+                                     root / "archives")
+        env = self.apt_env(conf)
+        # Archive snapshots are old by definition; signatures are still verified.
+        run(["apt-get", "update", "-q", "-o", "Acquire::Check-Valid-Until=false"], env=env)
+        dump = run(["apt-cache", "dumpavail"], env=env, capture=True, quiet=True).stdout
+        old = {f["Package"]: st for f, st in parse_stanzas(dump)}
+        fields = {f["Package"]: f for f, _st in parse_stanzas(dump)}
+
+        def likely(f):
+            return f.get("Essential") == "yes" or f.get("Priority") in ("required", "important", "standard")
+
+        extra = set(p.get("BASELINE_EXTRA_PACKAGES", "").split())
+        m1 = {n for n, f in fields.items() if likely(f)} | {n for n in extra if n in old}
+        bundle_now = {n for n, _v, _a in self.simulate(self.apt_env(self.apt_conf), self.deb_top)}
+        m2 = m1 | {n for n in bundle_now if n in old}
+        self.models = []
+        for label, base in (("M1-standard+mx", m1), ("M2-worst-case", m2)):
+            closed = self.simulate(env, sorted(base))
+            status = root / ("status-%s" % label)
+            with open(status, "w", encoding="utf-8") as fh:
+                for name, _v, _a in sorted(closed):
+                    fh.write(old[name].strip("\n") + "\nStatus: install ok installed\n\n")
+            log("baseline %s: %d installed packages at %s versions" % (label, len(closed), snap.rsplit("/", 1)[-1]))
+            self.models.append((label, status))
+        return list(self.models)
 
     def parse_apt_sim(self, text):
         wanted = set()
@@ -526,7 +638,10 @@ class Builder:
 
         req_lines = read_list_file(BUILDER_DIR / "requirements.in")
         self.top_reqs = [Requirement(r) for r in req_lines]
-        sdist_names = {canonicalize_name(n) for n in read_list_file(BUILDER_DIR / "sdist-fallback.txt")}
+        # sdist-fallback.txt lines: NAME [manual-deps]
+        fallback = [line.split() for line in read_list_file(BUILDER_DIR / "sdist-fallback.txt")]
+        sdist_names = {canonicalize_name(f[0]) for f in fallback}
+        self.sdist_manual = {canonicalize_name(f[0]) for f in fallback if "manual-deps" in f[1:]}
         wheels = self.payload / "wheels"
         sdists = self.payload / "sdists"
 
@@ -570,14 +685,22 @@ class Builder:
         if pyproject is not None:
             data = tomllib.loads(pyproject.decode("utf-8"))
             build_reqs = list(data.get("build-system", {}).get("requires", build_reqs))
+        from packaging.version import Version
         dynamic = {d.lower() for d in meta.get_all("Dynamic") or []}
-        if meta.get("Metadata-Version", "1.0") < "2.2" or "requires-dist" in dynamic:
-            runtime = meta.get_all("Requires-Dist") or []
-            if not runtime and pyproject is None:
-                log("WARNING: %s has no static dependency metadata; assuming none. Verify manually."
-                    % sdist.name)
-        else:
-            runtime = meta.get_all("Requires-Dist") or []
+        from packaging.utils import canonicalize_name
+        manual = canonicalize_name(meta.get("Name", "")) in getattr(self, "sdist_manual", set())
+        if not manual and (Version(meta.get("Metadata-Version", "1.0")) < Version("2.2") or "requires-dist" in dynamic):
+            # Dependencies are only known after running the package's build code,
+            # which cannot be done reliably for a foreign target here. Refuse rather
+            # than guess (an incomplete wheelhouse would only fail on the target).
+            raise BuildError(
+                "%s does not declare static dependency metadata (Metadata-Version %s%s). "
+                "List its runtime dependencies explicitly in builder/requirements.in, mark the "
+                "entry 'NAME manual-deps' in builder/sdist-fallback.txt, and rerun; the listed "
+                "dependencies are then resolved and audited like every other package."
+                % (sdist.name, meta.get("Metadata-Version", "?"),
+                   ", Requires-Dist dynamic" if "requires-dist" in dynamic else ""))
+        runtime = meta.get_all("Requires-Dist") or []
         log("sdist %s: build requires %s" % (sdist.name, build_reqs))
         return build_reqs + list(runtime)
 
@@ -735,6 +858,12 @@ class Builder:
             ("GLIBC_VERSION", "%d.%d" % self.glibc),
             ("WHEEL_PLATFORM_MAX", self.wheel_platforms()[0]),
             ("DEB_TOP_LEVEL", " ".join(self.deb_top)),
+            ("DEB_LOCKSTEP_BASE", " ".join(self.lockstep) or "none"),
+            ("DEB_BASELINE_MODEL", "skipped" if self.args.skip_baseline_model else
+             "Debian %s release snapshot %s (M1 standard+MX-like, M2 worst case)"
+             % (self.profile.get("DEBIAN_VERSION", ""), self.profile.get("DEBIAN_BASELINE_SNAPSHOT", ""))),
+            ("TARGET_STATE", ("exported dpkg status sha256 %s" % sha256_file(self.target_state / "status"))
+             if self.target_state else "none (generic MX 25 / Debian 13 resolution)"),
             ("DEB_COUNT", str(len(self.deb_records))),
             ("DEB_TOTAL_BYTES", str(sum(r["size"] for r in self.deb_records))),
             ("DEB_INSTALLED_SIZE_KB", str(sum(r["installed_kb"] for r in self.deb_records))),
@@ -947,10 +1076,38 @@ class Builder:
         ok = sim.returncode == 0
         got = self.parse_apt_sim(sim.stdout) if ok else set()
         expect = {(r["name"], r["version"], r["arch"]) for r in self.deb_records}
-        self.record("deb: offline resolution from local repo only", ok and got == expect,
-                    "%d/%d packages resolvable from empty system" % (len(got), len(expect)))
+        self.record("deb: offline resolution from local repo only", ok and got <= expect,
+                    "%d packages for an empty system, all from the bundle" % len(got))
+        everything = sorted(r["name"] for r in self.deb_records)
+        sim = run(["apt-get", "-s", "-q", "install", "--no-install-recommends", *everything],
+                  env=env, capture=True, check=False)
+        got = self.parse_apt_sim(sim.stdout) if sim.returncode == 0 else set()
+        self.record("deb: every bundled package installable offline", got == expect,
+                    "%d/%d" % (len(got), len(expect)))
+        for label, status in getattr(self, "models", []):
+            sim = run(["apt-get", "-s", "-q", "install", "--no-install-recommends", "-o",
+                       "Dir::State::status=%s" % status, *self.deb_top], env=env, capture=True, check=False)
+            if sim.returncode != 0:
+                print(sim.stdout[-3000:], flush=True)
+            self.record("deb: offline resolution, baseline %s" % label,
+                        sim.returncode == 0 and not re.search(r"(?m)^Remv ", sim.stdout),
+                        "%d upgrade(s), %d new" % (len(re.findall(r"(?m)^Inst \S+ \[", sim.stdout)),
+                                                   len(re.findall(r"(?m)^Inst \S+ \(", sim.stdout))))
+        if self.target_state:
+            tstatus = apt_root / "state" / "target-status"
+            shutil.copyfile(self.target_state / "status", tstatus)
+            sim = run(["apt-get", "-s", "-q", "install", "--no-install-recommends", "-o",
+                       "Dir::State::status=%s" % tstatus, *self.deb_top], env=env, capture=True, check=False)
+            if sim.returncode != 0:
+                print(sim.stdout[-3000:], flush=True)
+            self.record("deb: offline resolution against exported target state", sim.returncode == 0
+                        and not re.search(r"(?m)^Remv ", sim.stdout), "")
+        else:
+            self.results.append(("deb: offline resolution against exported target state", "SKIP",
+                                 "no --target-state given"))
 
     def offline_pip_test(self):
+        """Offline, hash-checked resolution of requirements.lock from the wheelhouse only."""
         dest = self.staging / "pip-offline-test"
         dest.mkdir()
         env = self.pip_env()
@@ -958,18 +1115,40 @@ class Builder:
             if k.lower().endswith("_proxy"):
                 del env[k]
         env["http_proxy"] = env["https_proxy"] = "http://127.0.0.1:9"
-        cmd = [sys.executable, "-m", "pip", "download", "--isolated", "--no-index", "--no-cache-dir",
-               "--find-links", self.payload / "wheels", "--find-links", self.payload / "sdists",
-               "--require-hashes", "--dest", dest, "--progress-bar", "off",
-               "-r", self.bundle_dir / "requirements.lock"]
+        base = [sys.executable, "-m", "pip", "download", "--isolated", "--no-index", "--no-cache-dir",
+                "--find-links", self.payload / "wheels", "--find-links", self.payload / "sdists",
+                "--require-hashes", "--dest", dest, "--progress-bar", "off"]
+        sdist_names = {r["canonical"] for r in self.sdist_records}
+        lock_lines = (self.bundle_dir / "requirements.lock").read_text().split("\n")
+        entries = []
+        for line in lock_lines:
+            if line and not line.startswith(("#", " ")):
+                entries.append([line])
+            elif line.startswith(" ") and entries:
+                entries[-1].append(line)
+        from packaging.utils import canonicalize_name
+        wheel_lock = self.staging / "lock-wheels.txt"
+        sdist_lock = self.staging / "lock-sdists.txt"
+        wheel_lock.write_text("\n".join("\n".join(e) for e in entries
+                                         if canonicalize_name(e[0].split("==")[0]) not in sdist_names) + "\n")
+        sdist_lock.write_text("\n".join("\n".join(e) for e in entries
+                                         if canonicalize_name(e[0].split("==")[0]) in sdist_names) + "\n")
+        # Wheels: explicit target tags (never the staging interpreter's own).
+        cmd = base + ["--only-binary=:all:"] + self.pip_target_args() + ["-r", wheel_lock]
         if self.sdist_records:
-            cmd += ["--no-deps"]
-        else:
-            cmd += ["--only-binary=:all:"] + self.pip_target_args()
+            cmd.append("--no-deps")  # closure already verified with target markers
         proc = run(cmd, env=env, check=False, capture=True)
+        detail = proc.stdout[-500:] if proc.returncode else ""
+        ok = proc.returncode == 0
+        if ok and self.sdist_records:
+            # Preparing each sdist offline proves its build requirements are bundled.
+            sproc = run(base + ["--no-binary=" + ",".join(sorted(sdist_names)), "--no-deps", "-r", sdist_lock],
+                        env=env, check=False, capture=True)
+            ok = sproc.returncode == 0
+            detail = sproc.stdout[-500:] if not ok else ""
         n = len(list(dest.iterdir()))
-        self.record("wheel: offline hash-checked resolution of lock", proc.returncode == 0 and n == len(self.wheel_records),
-                    "%d/%d distributions" % (n, len(self.wheel_records)) if proc.returncode == 0 else proc.stdout[-500:])
+        self.record("wheel: offline hash-checked resolution of lock", ok and n == len(self.wheel_records),
+                    detail or "%d/%d distributions (%d sdist)" % (n, len(self.wheel_records), len(self.sdist_records)))
 
     # -- integrity, archive, extraction tests -----------------------------
     def write_sums(self):
@@ -1069,6 +1248,8 @@ class Builder:
             log("%-50s %s %s" % r)
 
     def build(self):
+        if self.target_state_arg:
+            self.target_state = self.load_target_state(Path(self.target_state_arg).resolve())
         self.check_storage()
         self.make_staging()
         ok = False
@@ -1116,6 +1297,9 @@ def main():
     ap.add_argument("--profile", default="mx25-amd64")
     ap.add_argument("--min-free-gb", default="4")
     ap.add_argument("--debian-keyring", default="")
+    ap.add_argument("--target-state", default="", help="directory from export-target-state.sh")
+    ap.add_argument("--skip-baseline-model", action="store_true",
+                    help="do not model un-updated Debian 13.0 targets (not recommended)")
     ap.add_argument("--keep-staging", action="store_true")
     ap.add_argument("--check-storage-only", action="store_true")
     ap.add_argument("--in-tools-venv", action="store_true", help=argparse.SUPPRESS)

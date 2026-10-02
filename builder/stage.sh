@@ -32,8 +32,12 @@ say "staging environment: $OS_PRETTY, $(uname -m)"
 
 PREREQ_PKGS=(python3 python3-venv gpgv ca-certificates debian-archive-keyring shellcheck)
 
+for cmd in apt-get dpkg-deb; do
+    command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found: the staging environment needs a working APT/dpkg"
+done
+
 missing=()
-for cmd in python3 apt-get dpkg-deb tar gzip sha256sum find; do
+for cmd in python3 tar gzip sha256sum find; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 if ! command -v gpgv >/dev/null 2>&1 && ! command -v sqv >/dev/null 2>&1; then

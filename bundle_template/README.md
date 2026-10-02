@@ -16,6 +16,7 @@ install time.
 | BUILD_INFO.txt | Target profile, Python version/ABI, glibc, counts, build date |
 | wireless-audit.txt | What was checked to exclude Bluetooth/Wi-Fi/cellular packages, and the result |
 | SHA256SUMS / MANIFEST.txt | Checksums and inventory of every file |
+| export-target-state.sh | Captures this machine's package state for an exact-match rebuild |
 
 ## Install
 
@@ -49,7 +50,12 @@ question). `./install.sh --preflight-only` runs the checks alone, without root.
 * Installs only the packages in deb-install-list.txt and the dependencies they
   require. It never runs upgrade/full-upgrade/dist-upgrade and aborts if any
   package would be removed. Bundled versions are installed only where needed.
-  Already-installed newer versions are kept.
+  Already-installed newer versions are kept. On a machine that has not
+  installed recent updates, some already-installed base packages must be
+  upgraded together with the bundle's versions, for example libc, OpenSSL,
+  python3.13, and the util-linux family. The preflight lists every such
+  upgrade before asking for confirmation. BUILD_INFO.txt (DEB_LOCKSTEP_BASE)
+  names the base packages carried for this purpose.
 * Creates `~/.venvs/madd-python` with `python3 -m venv` and installs the
   wheelhouse with `pip install --no-index --require-hashes`. Debian's
   externally-managed system Python is not modified (no
@@ -61,7 +67,10 @@ question). `./install.sh --preflight-only` runs the checks alone, without root.
   functional tests (NumPy, SciPy, pandas, matplotlib, cryptography round trips,
   SQLite, SSL/CA paths, pyserial loopback). Without a graphical session the
   Tkinter check reports "Tkinter import passed; GUI display test unavailable",
-  which is not a failure.
+  which is not a failure. `sudo` usually drops DISPLAY. To run the GUI test
+  afterwards from your desktop session, run
+  `madd-python -B scripts/smoke_test.py` in this directory (`-B` keeps the
+  bundle free of bytecode files, so verify.sh still passes).
 
 It does not add services, daemons, cron jobs, hooks, firewall changes,
 boot changes, or wireless/NetworkManager changes. Re-running it is safe: already
@@ -96,6 +105,13 @@ This removes only the environment and the launchers that this bundle created
 removed automatically because other software may depend on them. Review any
 manual removal with `apt-get --simulate remove PACKAGE` first.
 
+## Building a bundle that matches this machine exactly
+
+`./export-target-state.sh DIR` (no root, no network, read-only) saves this
+machine's package list, os-release, and architecture to DIR. Carry DIR to the
+build device and run `build_madd_python_bundle.sh --target-state DIR`. The
+builder then resolves against this exact machine.
+
 ## If install.sh stops
 
 * Hash mismatch / missing / unexpected file: the copy is damaged or altered.
@@ -104,5 +120,5 @@ manual removal with `apt-get --simulate remove PACKAGE` first.
   Debian 13 on amd64.
 * Dependency resolution failed: the machine has newer versions of some core
   packages than the bundle (for example after installing later updates), or
-  is missing something the bundle cannot provide. Nothing was changed. Rebuild
-  the bundle so it matches current Debian 13 updates.
+  is missing something the bundle cannot provide. Nothing was changed. Run
+  ./export-target-state.sh and rebuild the bundle with --target-state.
