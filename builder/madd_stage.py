@@ -1,124 +1,88 @@
 #!/usr/bin/env python3
-"""Staging-side builder for the MADD offline Python bundle.
+"""Orchestrator of the MADD offline Python bundle builder.
 
-Runs inside the Ubuntu staging environment (ubuntu-claude-secure under
-proot-distro, or a local Debian/Ubuntu host with --staging local). It never
-needs root: Debian packages are resolved and downloaded by an isolated APT
-instance (private config, state, cache and an empty dpkg status) configured
-for the explicit target architecture, and Python wheels are fetched with
-explicit target platform/ABI tags.
+Runs directly in Termux on Android (preferred) or on a Debian/Ubuntu host.
+Everything that does not need Debian tooling happens here: target-wheel
+resolution (explicit target platform/ABI tags, never the builder's own),
+verification of every artifact, manifests and inventory, the wireless audit,
+static checks (ShellCheck is mandatory), the archive and its self-tests.
 
-Phase 0 (bootstrap) runs on the system python3 with the stdlib only and
-re-executes this file inside a private, hash-pinned tools venv.
+The Debian package stage (APT) runs through builder/stage.sh, either locally
+on a Debian/Ubuntu host or - from Termux - inside the existing proot-distro
+Ubuntu environment (--deb-stage proot:NAME). Its output is re-verified here.
+
+Phase 0 runs on the system python3 (stdlib only), builds a private tools venv
+from hash-pinned wheels (no ensurepip needed) and re-executes itself there.
 """
 
 import argparse
 import datetime
 import email.parser
 import gzip
-import hashlib
-import io
+import json
 import os
 import platform
 import re
 import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+import urllib.request
 import zipfile
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-BUILDER_DIR = REPO_ROOT / "builder"
-TEMPLATE_DIR = REPO_ROOT / "bundle_template"
-BUNDLE_FORMAT_VERSION = "1"
-STAGING_MARKER = ".madd-python-staging"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from madd_common import (  # noqa: E402
+    BUILDER_DIR, REPO_ROOT, STAGING_MARKER, TEMPLATE_DIR, BuildError, load_profile, log,
+    read_list_file, read_os_release, run, safe_rmtree, safe_rmtree_child, sha256_file,
+)
+
+BUNDLE_FORMAT_VERSION = "2"
 TOOLS_STAMP = ".madd-tools-stamp"
 PYPI_INDEX = "https://pypi.org/simple"
-
+PYPI_JSON = "https://pypi.org/pypi/%s/%s/json"
 EXECUTABLE_FILES = {"install.sh", "verify.sh", "uninstall-user-env.sh", "export-target-state.sh"}
-
-
-class BuildError(Exception):
-    pass
-
-
-def log(msg):
-    print("[madd-stage] " + msg, flush=True)
-
-
-def run(cmd, *, cwd=None, env=None, capture=False, check=True, quiet=False):
-    """Run a command given as an argument list (never through a shell)."""
-    if not quiet:
-        log("$ " + " ".join(str(c) for c in cmd))
-    proc = subprocess.run(
-        [str(c) for c in cmd],
-        cwd=cwd,
-        env=env,
-        check=False,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.STDOUT if capture else None,
-        text=True,
-    )
-    if check and proc.returncode != 0:
-        if capture and proc.stdout:
-            print(proc.stdout[-6000:], flush=True)
-        raise BuildError("command failed (exit %d): %s" % (proc.returncode, cmd[0]))
-    return proc
-
-
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def read_kv_file(path):
-    """Parse KEY=VALUE lines without executing anything."""
-    result = {}
-    for lineno, raw in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line)
-        if not m:
-            raise BuildError("%s:%d: malformed line" % (path, lineno))
-        result[m.group(1)] = m.group(2)
-    return result
-
-
-def read_list_file(path):
-    items = []
-    for raw in Path(path).read_text(encoding="utf-8").splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if line:
-            items.append(line)
-    return items
-
-
-def safe_rmtree(path, expected_parent, required_prefix):
-    """Delete a directory only if it is provably a staging dir created by us."""
-    path = Path(path)
-    if not str(path) or path.is_symlink():
-        raise BuildError("refusing to delete suspicious path: %r" % str(path))
-    resolved = path.resolve()
-    parent = Path(expected_parent).resolve()
-    if resolved.parent != parent:
-        raise BuildError("refusing to delete %s: not directly under %s" % (resolved, parent))
-    if not resolved.name.startswith(required_prefix):
-        raise BuildError("refusing to delete %s: unexpected name" % resolved)
-    if not (resolved / STAGING_MARKER).is_file():
-        raise BuildError("refusing to delete %s: staging marker missing" % resolved)
-    shutil.rmtree(resolved)
+MNT_PROJECT = "/mnt/madd-python-project"
+MNT_OUTPUT = "/mnt/madd-python-output"
+MNT_TARGET_STATE = "/mnt/madd-python-target-state"
 
 
 # ---------------------------------------------------------------------------
-# Phase 0: bootstrap private tools venv (stdlib only)
+# Phase 0: private tools venv from hash-pinned wheels (stdlib only)
 # ---------------------------------------------------------------------------
+
+def parse_pins(req):
+    """name==version --hash=sha256:... entries of tools-requirements.txt."""
+    text = Path(req).read_text().replace("\\\n", " ")
+    pins = re.findall(r"(?m)^([A-Za-z0-9_.-]+)==([A-Za-z0-9_.!+-]+)\s+--hash=sha256:([0-9a-f]{64})", text)
+    if not pins:
+        raise BuildError("no pinned tools in %s" % req)
+    return pins
+
+
+def fetch_pinned_wheel(name, version, sha, dest_dir):
+    """Download the wheel whose SHA-256 is pinned, via PyPI's JSON API over verified HTTPS."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for f in dest_dir.glob("*.whl"):
+        if f.name.lower().startswith(name.lower().replace("-", "_") + "-" + version) and sha256_file(f) == sha:
+            return f
+    with urllib.request.urlopen(PYPI_JSON % (name, version), timeout=60) as resp:
+        meta = json.load(resp)
+    for u in meta.get("urls", []):
+        if u.get("digests", {}).get("sha256") == sha and u["filename"].endswith(".whl"):
+            if not re.match(r"^[A-Za-z0-9_.+-]+\.whl$", u["filename"]) or not u["url"].startswith("https://"):
+                raise BuildError("unexpected PyPI file entry for %s" % name)
+            dest = dest_dir / u["filename"]
+            log("fetch %s" % u["url"])
+            with urllib.request.urlopen(u["url"], timeout=120) as resp, open(dest, "wb") as fh:
+                shutil.copyfileobj(resp, fh)
+            if sha256_file(dest) != sha:
+                dest.unlink()
+                raise BuildError("hash mismatch for %s" % u["filename"])
+            return dest
+    raise BuildError("PyPI has no wheel of %s %s with the pinned SHA-256" % (name, version))
+
 
 def bootstrap_tools_venv(out_dir):
     req = BUILDER_DIR / "tools-requirements.txt"
@@ -138,62 +102,17 @@ def bootstrap_tools_venv(out_dir):
             raise BuildError("unexpected tools venv location")
         shutil.rmtree(venv_dir)
     log("creating private tools venv at %s" % venv_dir)
-    run([sys.executable, "-m", "venv", venv_dir])
+    run([sys.executable, "-m", "venv", "--without-pip", venv_dir])
+    wheel_dir = cache / "tools-wheels"
+    wheels = {name.lower(): fetch_pinned_wheel(name, ver, sha, wheel_dir) for name, ver, sha in parse_pins(req)}
+    if "pip" not in wheels:
+        raise BuildError("tools-requirements.txt must pin pip")
     env = dict(os.environ, PIP_CONFIG_FILE=os.devnull, PIP_DISABLE_PIP_VERSION_CHECK="1")
-    run([vpy, "-m", "pip", "install", "--isolated", "--no-cache-dir", "--require-hashes",
-         "--only-binary=:all:", "--no-deps", "--index-url", PYPI_INDEX, "-r", req], env=env)
+    # Run pip from its own (hash-verified) wheel to install the pinned tools offline.
+    run([vpy, wheels["pip"] / "pip", "install", "--isolated", "--no-index", "--no-cache-dir",
+         "--require-hashes", "--only-binary=:all:", "--no-deps", "--find-links", wheel_dir, "-r", req], env=env)
     stamp.write_text(stamp_value + "\n")
     return vpy
-
-
-# ---------------------------------------------------------------------------
-# Debian control-file helpers
-# ---------------------------------------------------------------------------
-
-def parse_stanzas(text):
-    """Yield (fields_dict, raw_stanza_text) from a Debian Packages file."""
-    for block in re.split(r"\n\s*\n", text):
-        block = block.strip("\n")
-        if not block.strip():
-            continue
-        fields = {}
-        key = None
-        for line in block.split("\n"):
-            if line[:1] in (" ", "\t") and key:
-                fields[key] += "\n" + line
-                continue
-            k, sep, v = line.partition(":")
-            if not sep:
-                continue
-            key = k.strip()
-            fields[key] = v.strip()
-        yield fields, block
-
-
-def replace_field(stanza, field, value):
-    out = []
-    replaced = False
-    skipping = False
-    for line in stanza.split("\n"):
-        if skipping and line[:1] in (" ", "\t"):
-            continue
-        skipping = False
-        if line.startswith(field + ":"):
-            out.append("%s: %s" % (field, value))
-            replaced = True
-            skipping = True
-            continue
-        out.append(line)
-    if not replaced:
-        raise BuildError("field %s missing from stanza" % field)
-    return "\n".join(out)
-
-
-def upstream_version(debver):
-    v = debver.split(":", 1)[-1]
-    if "-" in v:
-        v = v.rsplit("-", 1)[0]
-    return v
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +123,7 @@ class Builder:
     def __init__(self, args):
         self.args = args
         self.out_dir = Path(args.output).resolve()
-        self.profile = read_kv_file(BUILDER_DIR / "profiles" / ("%s.conf" % args.profile))
-        for key in ("PROFILE_ID", "BUNDLE_NAME", "DEBIAN_CODENAME", "DEB_ARCH",
-                    "WHEEL_PLATFORM_ARCH", "UNAME_MACHINE", "DEBIAN_MIRROR",
-                    "DEBIAN_SECURITY_MIRROR", "DEBIAN_SUITES", "DEBIAN_COMPONENTS"):
-            if not self.profile.get(key):
-                raise BuildError("profile missing %s" % key)
+        self.profile = load_profile(args.profile)
         self.bundle_name = self.profile["BUNDLE_NAME"]
         self.deb_arch = self.profile["DEB_ARCH"]
         self.wheel_arch = self.profile["WHEEL_PLATFORM_ARCH"]
@@ -218,32 +132,27 @@ class Builder:
         self.results = []  # (test name, PASS/FAIL/SKIP, detail)
         self.build_epoch = int(os.environ.get("SOURCE_DATE_EPOCH") or time.time())
         self.staging = None
-        self.lockstep = []
-        self.target_state = None
-        self.target_state_arg = getattr(args, "target_state", "")
+        self.target_state = Path(args.target_state).resolve() if args.target_state else None
 
-    def load_target_state(self, d):
-        """Validate a directory produced by export-target-state.sh on the target machine."""
-        need = ("status", "dpkg-architecture", "os-release")
-        for n in need:
+    def validate_target_state(self):
+        """Check a directory produced by export-target-state.sh on the target machine."""
+        d = self.target_state
+        for n in ("status", "dpkg-architecture", "os-release"):
             if not (d / n).is_file():
                 raise BuildError("target state %s lacks %s (create it with export-target-state.sh)" % (d, n))
         arch = (d / "dpkg-architecture").read_text().strip()
         if arch != self.deb_arch:
             raise BuildError("target state architecture %r does not match profile %r" % (arch, self.deb_arch))
-        osr = {}
-        for line in (d / "os-release").read_text().splitlines():
-            k, sep, v = line.partition("=")
-            if sep:
-                osr[k] = v.strip().strip('"')
-        if osr.get("VERSION_CODENAME") not in ("", None, self.profile["DEBIAN_CODENAME"]):
-            raise BuildError("target state is %s, profile expects %s" % (osr.get("VERSION_CODENAME"), self.profile["DEBIAN_CODENAME"]))
+        osr = read_os_release(d / "os-release")
+        if osr.get("VERSION_CODENAME") not in ("", None, self.profile["TARGET_CODENAME"]) \
+                and not (d / "mx-version").is_file():
+            raise BuildError("target state is %s, profile expects %s"
+                             % (osr.get("VERSION_CODENAME"), self.profile["TARGET_CODENAME"]))
         status = (d / "status").read_text(encoding="utf-8", errors="replace")
         if "Package: dpkg\n" not in status:
             raise BuildError("target state status file does not look like /var/lib/dpkg/status")
         log("target state: %s (%d installed-package records, sha256 %s)"
             % (d, status.count("\nPackage: ") + 1, sha256_file(d / "status")[:16]))
-        return d
 
     # -- bookkeeping -------------------------------------------------------
     def record(self, name, ok, detail=""):
@@ -269,7 +178,7 @@ class Builder:
         (self.staging / STAGING_MARKER).write_text("created by madd_stage.py\n")
         self.bundle_dir = self.staging / self.bundle_name
         self.payload = self.bundle_dir / "payload"
-        for sub in ("debs", "wheels", "sdists"):
+        for sub in ("wheels", "sdists"):
             (self.payload / sub).mkdir(parents=True)
         (self.bundle_dir / "scripts").mkdir(parents=True)
         log("staging directory: %s" % self.staging)
@@ -278,312 +187,87 @@ class Builder:
         if self.staging and self.staging.exists():
             safe_rmtree(self.staging, self.out_dir, "staging.")
 
-    # -- Debian keyring --------------------------------------------------
-    def debian_keyring(self):
-        if self.args.debian_keyring:
-            kr = Path(self.args.debian_keyring).resolve()
-            if not kr.is_file():
-                raise BuildError("keyring not found: %s" % kr)
-            return kr
-        system = Path("/usr/share/keyrings/debian-archive-keyring.gpg")
-        if system.is_file():
-            return system
-        # Fetch Ubuntu's signed debian-archive-keyring package via the staging
-        # system's own (signature-verified) APT configuration; extract without root.
-        kdir = self.cache / "keyring"
-        kdir.mkdir(parents=True, exist_ok=True)
-        extracted = kdir / "root" / "usr/share/keyrings/debian-archive-keyring.gpg"
-        if extracted.is_file():
-            return extracted
-        for old in kdir.glob("debian-archive-keyring_*.deb"):
-            old.unlink()
-        proc = run(["apt-get", "download", "debian-archive-keyring"], cwd=kdir, capture=True, check=False)
-        debs = sorted(kdir.glob("debian-archive-keyring_*.deb"))
-        if proc.returncode != 0 or len(debs) != 1:
-            print(proc.stdout or "", flush=True)
-            raise BuildError(
-                "could not obtain debian-archive-keyring from the staging system's APT sources. "
-                "Run 'apt-get update' in the staging environment (or rerun the builder with "
-                "--install-staging-prereqs), or pass --debian-keyring PATH.")
-        run(["dpkg-deb", "-x", debs[0], kdir / "root"])
-        if not extracted.is_file():
-            raise BuildError("debian-archive-keyring package did not contain the expected keyring")
-        return extracted
-
-    # -- isolated APT ----------------------------------------------------
-    def write_apt_config(self, root, sources_text, lists_dir, archives_dir):
-        root = Path(root)
-        for sub in ("etc/apt.conf.d", "etc/sources.list.d", "etc/preferences.d",
-                    "etc/trusted.gpg.d", "state", "log", "cache"):
-            (root / sub).mkdir(parents=True, exist_ok=True)
-        Path(lists_dir, "partial").mkdir(parents=True, exist_ok=True)
-        Path(archives_dir, "partial").mkdir(parents=True, exist_ok=True)
-        (root / "state" / "status").write_text("")
-        (root / "etc" / "sources.list.d" / "madd.sources").write_text(sources_text)
-        conf = root / "apt.conf"
-        conf.write_text("\n".join([
-            'APT::Architecture "%s";' % self.deb_arch,
-            'APT::Architectures { "%s"; };' % self.deb_arch,
-            'APT::Install-Recommends "false";',
-            'APT::Install-Suggests "false";',
-            'APT::Get::List-Cleanup "true";',
-            'Acquire::Languages "none";',
-            'Acquire::GzipIndexes "false";',
-            'Acquire::IndexTargets::deb::Contents-deb::DefaultEnabled "false";',
-            'Dir::Etc "%s/etc/";' % root,
-            'Dir::Etc::main "%s/etc/apt.conf.main";' % root,
-            'Dir::Etc::parts "%s/etc/apt.conf.d/";' % root,
-            'Dir::Etc::sourcelist "%s/etc/sources.list";' % root,
-            'Dir::Etc::sourceparts "%s/etc/sources.list.d/";' % root,
-            'Dir::Etc::preferences "%s/etc/preferences";' % root,
-            'Dir::Etc::preferencesparts "%s/etc/preferences.d/";' % root,
-            'Dir::Etc::trusted "%s/etc/trusted.gpg";' % root,
-            'Dir::Etc::trustedparts "%s/etc/trusted.gpg.d/";' % root,
-            'Dir::State "%s/state/";' % root,
-            'Dir::State::status "%s/state/status";' % root,
-            'Dir::State::lists "%s/";' % lists_dir,
-            'Dir::Cache "%s/cache/";' % root,
-            'Dir::Cache::archives "%s/";' % archives_dir,
-            'Dir::Log "%s/log/";' % root,
-            'DPkg::Lock::Timeout "0";',
-            "",
-        ]))
-        (root / "etc" / "sources.list").write_text("")
-        return conf
-
-    def apt_env(self, conf, offline=False):
-        env = dict(os.environ, APT_CONFIG=str(conf), LC_ALL="C", DEBIAN_FRONTEND="noninteractive")
-        if offline:
-            for k in list(env):
-                if k.lower().endswith("_proxy"):
-                    del env[k]
-            # Unreachable proxy: any accidental network fetch fails loudly.
-            env["http_proxy"] = env["https_proxy"] = "http://127.0.0.1:9"
-        return env
-
-    def resolve_debs(self):
-        p = self.profile
-        keyring = self.debian_keyring()
-        log("Debian archive keyring: %s" % keyring)
-        components = p["DEBIAN_COMPONENTS"]
-        entries = [
-            "Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nArchitectures: %s\nSigned-By: %s\n"
-            % (p["DEBIAN_MIRROR"], p["DEBIAN_SUITES"], components, self.deb_arch, keyring),
-        ]
-        if p.get("DEBIAN_SECURITY_SUITES"):
-            entries.append(
-                "Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nArchitectures: %s\nSigned-By: %s\n"
-                % (p["DEBIAN_SECURITY_MIRROR"], p["DEBIAN_SECURITY_SUITES"], components, self.deb_arch, keyring))
-        for e in entries:
-            if not re.search(r"^URIs: https://", e, re.M):
-                raise BuildError("Debian mirrors must use https")
-        apt_root = self.staging / "apt"
-        lists = self.cache / ("apt-lists-%s" % p["PROFILE_ID"])
-        archives = self.cache / ("apt-archives-%s" % p["PROFILE_ID"])
-        conf = self.write_apt_config(apt_root, "\n".join(entries), lists, archives)
-        env = self.apt_env(conf)
-        run(["apt-get", "update", "-q"], env=env)
-
-        self.deb_top = read_list_file(BUILDER_DIR / "debian-packages.txt")
-        self.apt_conf, self.apt_root = conf, apt_root
-        wanted = self.simulate(env, self.deb_top)
-        log("dependency closure (empty system): %d packages" % len(wanted))
-        empty_names = {n for n, _v, _a in wanted}
-        forced = set()
-        if not self.args.skip_baseline_model:
-            for label, status in self.baseline_models(keyring):
-                ops = self.simulate(env, self.deb_top, status=status)
-                forced |= {n for n, _v, _a in ops}
-                log("baseline model %s: %d package operation(s)" % (label, len(ops)))
-        self.lockstep = sorted(forced - empty_names)
-        if self.lockstep:
-            wanted = self.simulate(env, self.deb_top + self.lockstep)
-            log("added %d base package(s) that older target systems must upgrade in lockstep: %s"
-                % (len(self.lockstep), " ".join(self.lockstep)))
-        if self.target_state:
-            tstatus = apt_root / "state" / "target-status"
-            shutil.copyfile(self.target_state / "status", tstatus)
-            tw = self.simulate(env, self.deb_top, status=tstatus)
-            extra = {w for w in tw if w[0] not in {n for n, _v, _a in wanted}}
-            log("target-state resolution: %d package operation(s), %d not already in the bundle"
-                % (len(tw), len(extra)))
-            wanted |= tw
-        names = sorted({n for n, _v, _a in wanted})
-        run(["apt-get", "-q", "-y", "install", "--download-only", "--no-install-recommends", *names],
-            env=env)
-
-        index = self.load_index(lists)
-        self.deb_records = []
-        seen_names = set()
-        for name, ver, arch in sorted(wanted):
-            if arch not in (self.deb_arch, "all"):
-                raise BuildError("resolved %s %s for wrong architecture %s" % (name, ver, arch))
-            if name in seen_names:
-                raise BuildError("duplicate package in closure: %s" % name)
-            seen_names.add(name)
-            fields, stanza = index.get((name, ver, arch), (None, None))
-            if fields is None:
-                raise BuildError("no signed index entry for %s %s %s" % (name, ver, arch))
-            src = archives / ("%s_%s_%s.deb" % (name, ver.replace(":", "%3a"), arch))
-            if not src.is_file():
-                raise BuildError("APT did not download %s" % src.name)
-            digest = sha256_file(src)
-            size = src.stat().st_size
-            if digest != fields.get("SHA256") or str(size) != fields.get("Size"):
-                raise BuildError("hash/size mismatch against signed index for %s" % src.name)
-            base = os.path.basename(fields["Filename"])
-            if not re.match(r"^[A-Za-z0-9.+~_-]+\.deb$", base):
-                raise BuildError("unexpected deb filename %r" % base)
-            dst = self.payload / "debs" / base
-            if dst.exists():
-                raise BuildError("deb filename collision: %s" % base)
-            shutil.copy2(src, dst)
-            self.deb_records.append({
-                "name": name, "version": ver, "arch": arch, "file": base,
-                "sha256": digest, "size": size,
-                "installed_kb": int(fields.get("Installed-Size", "0") or 0),
-                "fields": fields, "stanza": replace_field(stanza, "Filename", "./" + base),
-            })
-        self.record("deb: dependency closure downloaded and hash-verified", True,
-                    "%d packages, all %s/all" % (len(self.deb_records), self.deb_arch))
-
-        by_name = {r["name"]: r for r in self.deb_records}
-        for top in self.deb_top:
-            if top not in by_name:
-                # Requested name is virtual/transitional resolved to another package.
-                log("note: top-level %s resolved via another package" % top)
-        py = by_name.get("python3")
-        libc = by_name.get("libc6")
-        if not py or not libc:
-            raise BuildError("python3/libc6 missing from closure")
-        pyver = upstream_version(py["version"])
-        m = re.match(r"^(\d+)\.(\d+)\.(\d+)", pyver)
+    # -- Debian package stage (APT: local, or ubuntu-claude-secure from Termux) --
+    def deb_stage_command(self, work):
+        mode = self.args.deb_stage
+        extra = ["--profile", self.args.profile]
+        if self.args.skip_baseline_model:
+            extra.append("--skip-baseline-model")
+        if self.args.install_staging_prereqs:
+            extra.append("--install-staging-prereqs")
+        if mode == "local":
+            cmd = ["bash", BUILDER_DIR / "stage.sh", "--work", work, "--cache", self.cache] + extra
+            if self.target_state:
+                cmd += ["--target-state", self.target_state]
+            if self.args.archive_keyring:
+                cmd += ["--keyring", Path(self.args.archive_keyring).resolve()]
+            return cmd
+        m = re.match(r"^proot:([A-Za-z0-9][A-Za-z0-9._-]*)$", mode)
         if not m:
-            raise BuildError("cannot parse python3 version %r" % py["version"])
-        self.py_major, self.py_minor = int(m.group(1)), int(m.group(2))
-        self.py_full = "%s.%s.%s" % m.groups()
-        self.py_short = "%d.%d" % (self.py_major, self.py_minor)
-        self.py_abi = "cp%d%d" % (self.py_major, self.py_minor)
-        if "python%s" % self.py_short not in by_name:
-            raise BuildError("python%s interpreter package missing from closure" % self.py_short)
-        g = re.match(r"^(\d+)\.(\d+)", upstream_version(libc["version"]))
-        self.glibc = (int(g.group(1)), int(g.group(2)))
-        self.python_deb_version = by_name["python%s" % self.py_short]["version"]
+            raise BuildError("invalid --deb-stage %r" % mode)
+        if self.args.archive_keyring:
+            raise BuildError("--archive-keyring is only supported with a local Debian stage")
+        distro = m.group(1)
+        rel_work = Path(work).relative_to(self.out_dir).as_posix()
+        binds = ["--bind", "%s:%s" % (REPO_ROOT, MNT_PROJECT), "--bind", "%s:%s" % (self.out_dir, MNT_OUTPUT)]
+        inner = ["--work", "%s/%s" % (MNT_OUTPUT, rel_work), "--cache", "%s/cache" % MNT_OUTPUT] + extra
+        if self.target_state:
+            binds += ["--bind", "%s:%s" % (self.target_state, MNT_TARGET_STATE)]
+            inner += ["--target-state", MNT_TARGET_STATE]
+        return (["proot-distro", "login", distro] + binds +
+                ["--", "/usr/bin/env", "MADD_STAGING_LABEL=proot-distro %s, used for the APT stage only" % distro,
+                 "/bin/bash", "%s/builder/stage.sh" % MNT_PROJECT] + inner)
+
+    def run_deb_stage(self):
+        work = self.staging / "debstage"
+        log("Debian package stage via %s" % self.args.deb_stage)
+        run(self.deb_stage_command(work))
+        result = work / "deb-stage.json"
+        if not result.is_file():
+            raise BuildError("Debian package stage produced no result")
+        self.deb = json.loads(result.read_text())
+        if self.deb.get("profile") != self.profile["PROFILE_ID"] or self.deb.get("deb_arch") != self.deb_arch:
+            raise BuildError("Debian stage result is for a different profile/architecture")
+        for name, status, detail in self.deb["results"]:
+            if status != "PASS":
+                raise BuildError("Debian stage test did not pass: %s" % name)
+            self.results.append((name + " [apt stage]", status, detail))
+        os.replace(work / "apt", self.payload / "apt")
+        self.verify_deb_handoff()
+        t = self.deb["target"]
+        self.py_major, self.py_minor = t["python_major"], t["python_minor"]
+        self.py_full, self.py_short, self.py_abi = t["python_full"], t["python_short"], t["python_abi"]
+        self.python_deb_version = t["python_deb_version"]
+        self.glibc = tuple(t["glibc"])
+        self.deb_records = self.deb["records"]
+        self.deb_top = self.deb["deb_top"]
+        self.lockstep = self.deb["lockstep"]
         log("target Python: %s (%s), glibc %d.%d" % (self.py_full, self.py_abi, *self.glibc))
 
-    def simulate(self, env, pkgs, status=None):
-        """APT simulation (no changes) -> set of (name, version, arch) to install."""
-        cmd = ["apt-get", "-s", "-q", "install", "--no-install-recommends"]
-        if status is not None:
-            cmd += ["-o", "Dir::State::status=%s" % status]
-        proc = run(cmd + list(pkgs), env=env, capture=True, check=False, quiet=True)
-        if proc.returncode != 0:
-            print(proc.stdout[-4000:], flush=True)
-            raise BuildError("APT could not resolve %s" % ("the target-state system" if status else "the package set"))
-        return self.parse_apt_sim(proc.stdout)
+    def verify_deb_handoff(self):
+        """Re-check every file that crossed the stage boundary before trusting it."""
+        apt = self.payload / "apt"
+        expected = {"sources.txt", "preferences"}
+        bad = []
+        for r in self.deb["records"]:
+            if r["arch"] not in (self.deb_arch, "all"):
+                bad.append("%s is %s" % (r["name"], r["arch"]))
+            for rel in [r["path"]] + r["copies"]:
+                expected.add(rel)
+                f = apt / rel
+                if not f.is_file() or f.is_symlink() or sha256_file(f) != r["sha256"]:
+                    bad.append(rel)
+        for ix in self.deb["index_files"]:
+            expected.add(ix["path"])
+            f = apt / ix["path"]
+            if not f.is_file() or sha256_file(f) != ix["sha256"]:
+                bad.append(ix["path"])
+        present = {p.relative_to(apt).as_posix() for p in apt.rglob("*") if not p.is_dir()}
+        bad += sorted(present - expected)
+        self.record("deb: stage output re-verified after hand-off", not bad,
+                    "; ".join(bad[:5]) if bad else "%d packages, %d signed index files"
+                    % (len(self.deb["records"]), len(self.deb["index_files"])))
 
-    @staticmethod
-    def relations(text):
-        """Yield (name, op, version) for every alternative in a Debian relation field."""
-        for part in (text or "").split(","):
-            for alt in part.split("|"):
-                m = re.match(r"\s*([a-z0-9][a-z0-9.+-]*)(?::\S+)?\s*(?:\(\s*([<>=]+)\s*([^)\s]+)\s*\))?", alt)
-                if m:
-                    yield m.group(1), m.group(2), m.group(3)
-
-    def baseline_models(self, keyring):
-        """Synthetic dpkg status files describing un-updated MX 25 / Debian 13.0 machines.
-
-        A machine that has not installed later updates holds older versions of
-        packages that pin bundled libraries exactly (e.g. util-linux PreDepends
-        libuuid1 (= version)). APT then has to upgrade those siblings too, so they
-        must be in the bundle. The baseline is built from the signed Debian 13.0
-        release index (snapshot.debian.org) and closed under its dependencies:
-          M1: Essential/required/important/standard + MX-like desktop packages
-          M2: M1 + every bundle package at its 13.0 version (worst case for upgrades)
-        Results are cached per build in self.models for the offline re-check.
-        """
-        p = self.profile
-        snap = p.get("DEBIAN_BASELINE_SNAPSHOT", "")
-        if not snap.startswith("https://"):
-            raise BuildError("profile needs an https DEBIAN_BASELINE_SNAPSHOT (or use --skip-baseline-model)")
-        root = self.staging / "apt-baseline"
-        sources = ("Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nArchitectures: %s\nSigned-By: %s\n"
-                   % (snap, p["DEBIAN_CODENAME"], p["DEBIAN_COMPONENTS"], self.deb_arch, keyring))
-        conf = self.write_apt_config(root, sources, self.cache / ("apt-lists-baseline-%s" % p["PROFILE_ID"]),
-                                     root / "archives")
-        env = self.apt_env(conf)
-        # Archive snapshots are old by definition; signatures are still verified.
-        run(["apt-get", "update", "-q", "-o", "Acquire::Check-Valid-Until=false"], env=env)
-        dump = run(["apt-cache", "dumpavail"], env=env, capture=True, quiet=True).stdout
-        old = {f["Package"]: st for f, st in parse_stanzas(dump)}
-        fields = {f["Package"]: f for f, _st in parse_stanzas(dump)}
-
-        def likely(f):
-            return f.get("Essential") == "yes" or f.get("Priority") in ("required", "important", "standard")
-
-        extra = set(p.get("BASELINE_EXTRA_PACKAGES", "").split())
-        m1 = {n for n, f in fields.items() if likely(f)} | {n for n in extra if n in old}
-        bundle_now = {n for n, _v, _a in self.simulate(self.apt_env(self.apt_conf), self.deb_top)}
-        m2 = m1 | {n for n in bundle_now if n in old}
-        self.models = []
-        for label, base in (("M1-standard+mx", m1), ("M2-worst-case", m2)):
-            closed = self.simulate(env, sorted(base))
-            status = root / ("status-%s" % label)
-            with open(status, "w", encoding="utf-8") as fh:
-                for name, _v, _a in sorted(closed):
-                    fh.write(old[name].strip("\n") + "\nStatus: install ok installed\n\n")
-            log("baseline %s: %d installed packages at %s versions" % (label, len(closed), snap.rsplit("/", 1)[-1]))
-            self.models.append((label, status))
-        return list(self.models)
-
-    def parse_apt_sim(self, text):
-        wanted = set()
-        for line in text.splitlines():
-            if line.startswith("Remv "):
-                raise BuildError("unexpected removal in empty-status simulation: " + line)
-            m = re.match(r"^Inst (\S+) (?:\[\S+\] )?\((\S+) .*\[(\S+)\]\)", line)
-            if m:
-                wanted.add((m.group(1).split(":")[0], m.group(2), m.group(3)))
-        if not wanted:
-            raise BuildError("APT simulation produced no packages")
-        return wanted
-
-    def load_index(self, lists):
-        index = {}
-        files = sorted(Path(lists).glob("*_Packages"))
-        if not files:
-            raise BuildError("no Packages indexes found in %s" % lists)
-        for f in files:
-            for fields, stanza in parse_stanzas(f.read_text(encoding="utf-8", errors="replace")):
-                key = (fields.get("Package"), fields.get("Version"), fields.get("Architecture"))
-                index.setdefault(key, (fields, stanza))
-        return index
-
-    def write_local_repo(self):
-        debs = self.payload / "debs"
-        body = "\n\n".join(r["stanza"] for r in sorted(self.deb_records, key=lambda r: r["name"])) + "\n"
-        (debs / "Packages").write_text(body, encoding="utf-8")
-        with open(debs / "Packages.gz", "wb") as raw:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=self.build_epoch) as gz:
-                gz.write(body.encode("utf-8"))
-        date = time.strftime("%a, %d %b %Y %H:%M:%S UTC", time.gmtime(self.build_epoch))
-        lines = [
-            "Origin: madd-python-bundle",
-            "Label: madd-python-bundle",
-            "Suite: madd-offline",
-            "Codename: madd-offline",
-            "Architectures: %s all" % self.deb_arch,
-            "Date: %s" % date,
-            "Description: Offline local repository for %s (no network sources)" % self.bundle_name,
-            "SHA256:",
-        ]
-        for name in ("Packages", "Packages.gz"):
-            f = debs / name
-            lines.append(" %s %d %s" % (sha256_file(f), f.stat().st_size, name))
-        (debs / "Release").write_text("\n".join(lines) + "\n")
-
-    # -- Python wheelhouse ------------------------------------------------
     def wheel_platforms(self):
         major, minor = self.glibc
         if major != 2:
@@ -752,7 +436,10 @@ class Builder:
         meta_cache = {}
         missing = []
         reachable = set()
-        queue = [(canonicalize_name(r.name), frozenset(r.extras), r) for r in self.top_reqs]
+        self.closure_deps = {}
+        top = [r for r in self.top_reqs if r.marker is None or r.marker.evaluate(dict(env, extra=""))]
+        self.top_names = sorted({canonicalize_name(r.name) for r in top})
+        queue = [(canonicalize_name(r.name), frozenset(r.extras), r) for r in top]
         for sd in (d for d in dists.values() if d["kind"] == "sdists"):
             for req in self.sdist_requirements(sd["file"]):
                 r = Requirement(req)
@@ -772,11 +459,13 @@ class Builder:
             done.add((name, extras))
             if name not in meta_cache:
                 meta_cache[name] = self.read_dist_metadata(d["file"])
+            deps = self.closure_deps.setdefault(name, set())
             for dep in meta_cache[name].get_all("Requires-Dist") or []:
                 r = Requirement(dep)
                 if r.marker is not None:
                     if not any(r.marker.evaluate(dict(env, extra=e)) for e in sorted(extras | {""})):
                         continue
+                deps.add(canonicalize_name(r.name))
                 queue.append((canonicalize_name(r.name), frozenset(r.extras), r))
         if prune and not missing:
             for name, d in dists.items():
@@ -818,6 +507,7 @@ class Builder:
             "--find-links payload/sdists --require-hashes -r requirements.lock",
         ]
         wm = ["# name version kind filename sha256 size tags"]
+        closure = ["# canonical-name version sha256 required-distributions(comma-separated, target markers applied)"]
         for name in sorted(dists):
             d = dists[name]
             meta = self.read_dist_metadata(d["file"])
@@ -832,66 +522,106 @@ class Builder:
             lock.append("%s==%s \\\n    --hash=sha256:%s" % (rec["name"], rec["version"], digest))
             wm.append("%s %s %s %s %s %d %s" % (rec["name"], rec["version"], d["kind"][:-1], rec["file"],
                                                  digest, rec["size"], tags))
+            closure.append("%s %s %s %s" % (name, rec["version"], digest,
+                                            ",".join(sorted(self.closure_deps.get(name, ()))) or "-"))
         (b / "requirements.lock").write_text("\n".join(lock) + "\n")
         (b / "wheel-manifest.txt").write_text("\n".join(wm) + "\n")
+        (b / "python-closure.txt").write_text("\n".join(closure) + "\n")
+        (b / "python-top-level.txt").write_text("".join(n + "\n" for n in self.top_names))
 
-        dm = ["# package version architecture filename sha256 size installed-size-kb"]
+        dm = ["# package version architecture path(under payload/apt) sha256 size installed-size-kb"]
         for r in sorted(self.deb_records, key=lambda r: r["name"]):
-            dm.append("%s %s %s %s %s %d %d" % (r["name"], r["version"], r["arch"], r["file"],
+            dm.append("%s %s %s %s %s %d %d" % (r["name"], r["version"], r["arch"], r["path"],
                                                  r["sha256"], r["size"], r["installed_kb"]))
         (b / "deb-manifest.txt").write_text("\n".join(dm) + "\n")
 
         self.sdist_records = [r for r in self.wheel_records if r["kind"] == "sdists"]
+        pipver = next((r["version"] for r in self.wheel_records if r["canonical"] == "pip"), "")
+        p = self.profile
         info = [
             ("BUNDLE_NAME", self.bundle_name),
             ("BUNDLE_FORMAT_VERSION", BUNDLE_FORMAT_VERSION),
-            ("PROFILE_ID", self.profile["PROFILE_ID"]),
-            ("TARGET_DISTRIBUTION", self.profile.get("TARGET_DISTRIBUTION", "")),
-            ("DEBIAN_VERSION", self.profile.get("DEBIAN_VERSION", "")),
-            ("DEBIAN_CODENAME", self.profile["DEBIAN_CODENAME"]),
+            ("PROFILE_ID", p["PROFILE_ID"]),
+            ("TARGET_DISTRIBUTION", p["TARGET_DISTRIBUTION"]),
+            ("TARGET_FAMILY", p["TARGET_FAMILY"]),
+            ("TARGET_OS_ID", p["TARGET_OS_ID"]),
+            ("TARGET_VERSION_ID", p["TARGET_VERSION_ID"]),
+            ("TARGET_CODENAME", p["TARGET_CODENAME"]),
+            ("TARGET_MX_RELEASE", p.get("TARGET_MX_RELEASE", "")),
+            ("TARGET_KEYRING", p["TARGET_KEYRING"]),
             ("DEB_ARCH", self.deb_arch),
-            ("UNAME_MACHINE", self.profile["UNAME_MACHINE"]),
+            ("UNAME_MACHINE", p["UNAME_MACHINE"]),
             ("PYTHON_VERSION", self.py_short),
             ("PYTHON_FULL_VERSION", self.py_full),
             ("PYTHON_DEB_VERSION", self.python_deb_version),
             ("PYTHON_ABI", self.py_abi),
+            ("PIP_VERSION", pipver),
             ("GLIBC_VERSION", "%d.%d" % self.glibc),
             ("WHEEL_PLATFORM_MAX", self.wheel_platforms()[0]),
             ("DEB_TOP_LEVEL", " ".join(self.deb_top)),
             ("DEB_LOCKSTEP_BASE", " ".join(self.lockstep) or "none"),
             ("DEB_BASELINE_MODEL", "skipped" if self.args.skip_baseline_model else
-             "Debian %s release snapshot %s (M1 standard+MX-like, M2 worst case)"
-             % (self.profile.get("DEBIAN_VERSION", ""), self.profile.get("DEBIAN_BASELINE_SNAPSHOT", ""))),
+             "%s [%s] (%s)" % (p["BASELINE_URI"], p["BASELINE_SUITES"], ", ".join(self.deb["models"]))),
             ("TARGET_STATE", ("exported dpkg status sha256 %s" % sha256_file(self.target_state / "status"))
-             if self.target_state else "none (generic MX 25 / Debian 13 resolution)"),
+             if self.target_state else "none (generic resolution for %s)" % p["TARGET_DISTRIBUTION"]),
+            ("APT_ORIGINS", " ".join(self.deb["origins"])),
+            ("APT_SOURCES", "; ".join("%s %s [%s]" % (rid, p["REPO_%s_URI" % rid.upper()],
+                                                       p["REPO_%s_SUITES" % rid.upper()])
+                                      for rid in p["REPO_IDS"].split()) + " (%s)" % p["REPO_COMPONENTS"]),
             ("DEB_COUNT", str(len(self.deb_records))),
             ("DEB_TOTAL_BYTES", str(sum(r["size"] for r in self.deb_records))),
             ("DEB_INSTALLED_SIZE_KB", str(sum(r["installed_kb"] for r in self.deb_records))),
+            ("APT_PAYLOAD_BYTES", str(sum(f.stat().st_size for f in (self.payload / "apt").rglob("*") if f.is_file()))),
             ("WHEEL_COUNT", str(sum(1 for r in self.wheel_records if r["kind"] == "wheels"))),
             ("SDIST_COUNT", str(len(self.sdist_records))),
             ("PYDIST_TOTAL_BYTES", str(sum(r["size"] for r in self.wheel_records))),
-            ("DEBIAN_SOURCES", "%s [%s] + %s [%s] (%s)" % (
-                self.profile["DEBIAN_MIRROR"], self.profile["DEBIAN_SUITES"],
-                self.profile["DEBIAN_SECURITY_MIRROR"], self.profile.get("DEBIAN_SECURITY_SUITES", ""),
-                self.profile["DEBIAN_COMPONENTS"])),
             ("PYTHON_INDEX", PYPI_INDEX),
             ("BUILD_DATE_UTC", datetime.datetime.fromtimestamp(self.build_epoch, datetime.timezone.utc)
              .strftime("%Y-%m-%dT%H:%M:%SZ")),
             ("BUILD_EPOCH", str(self.build_epoch)),
+            ("BUILDER_ENVIRONMENT", self.args.builder_env),
             ("BUILDER_HOST_ARCH", platform.machine()),
-            ("BUILDER_STAGING", self.staging_os()),
+            ("BUILDER_PYTHON", "%s %s" % (platform.python_implementation(), platform.python_version())),
+            ("DEB_STAGE_ENVIRONMENT", self.deb["environment"]),
+            ("DEB_STAGE_KEYRING", self.deb["keyring"]),
         ]
         for k, v in info:
             if "\n" in v:
                 raise BuildError("newline in BUILD_INFO value %s" % k)
         (b / "BUILD_INFO.txt").write_text("".join("%s=%s\n" % kv for kv in info))
+        self.write_inventory(dict(info))
 
-    def staging_os(self):
-        try:
-            osr = read_os_release()
-            return "%s (%s)" % (osr.get("PRETTY_NAME", "unknown"), os.environ.get("MADD_STAGING_LABEL", "local"))
-        except OSError:
-            return "unknown"
+    def write_inventory(self, info):
+        """Human-readable inventory: what is inside, for which target, built where."""
+        b = self.bundle_dir
+        lines = [
+            "MADD offline Python bundle inventory: %s" % info["BUNDLE_NAME"],
+            "(Timestamps are informational; integrity is SHA256SUMS, verified by verify.sh.)",
+            "",
+            "Target distribution:  %s" % info["TARGET_DISTRIBUTION"],
+            "Target family:        %s (os-release ID=%s VERSION_ID=%s codename %s)"
+            % (info["TARGET_FAMILY"], info["TARGET_OS_ID"], info["TARGET_VERSION_ID"], info["TARGET_CODENAME"]),
+            "Target architecture:  %s (uname -m %s)" % (info["DEB_ARCH"], info["UNAME_MACHINE"]),
+            "Python:               %s (%s), Debian package %s" % (info["PYTHON_FULL_VERSION"], info["PYTHON_ABI"],
+                                                                 info["PYTHON_DEB_VERSION"]),
+            "pip:                  %s" % info["PIP_VERSION"],
+            "Builder architecture: %s" % info["BUILDER_HOST_ARCH"],
+            "Builder environment:  %s" % info["BUILDER_ENVIRONMENT"],
+            "Builder Python:       %s" % info["BUILDER_PYTHON"],
+            "APT stage:            %s" % info["DEB_STAGE_ENVIRONMENT"],
+            "Built (UTC):          %s" % info["BUILD_DATE_UTC"],
+            "",
+            "Debian packages (%s):" % info["DEB_COUNT"],
+        ]
+        for r in sorted(self.deb_records, key=lambda r: r["name"]):
+            lines.append("  %-36s %-34s %-5s sha256 %s" % (r["name"], r["version"], r["arch"], r["sha256"]))
+        lines += ["", "Python distributions (%d):" % len(self.wheel_records)]
+        for w in sorted(self.wheel_records, key=lambda w: w["canonical"]):
+            lines.append("  %-28s %-14s %s sha256 %s" % (w["name"], w["version"], w["file"], w["sha256"]))
+        lines += ["", "Signed APT metadata (verified on the target with %s):" % info["TARGET_KEYRING"]]
+        for ix in self.deb["index_files"]:
+            lines.append("  %s sha256 %s" % (ix["path"], ix["sha256"]))
+        (b / "inventory.txt").write_text("\n".join(lines) + "\n")
 
     def copy_templates(self):
         for src in sorted(TEMPLATE_DIR.rglob("*")):
@@ -972,7 +702,7 @@ class Builder:
                 m = self.KEYWORDS.search(f.get(fld, ""))
                 if m:
                     hit("deb", r["name"], "%s keyword '%s'" % (fld, m.group(0)))
-            for path in self.deb_paths(self.payload / "debs" / r["file"]):
+            for path in r["contents"]:
                 if self.PATH_DENY.search(path):
                     hit("deb", r["name"], "path %s" % path)
         report.append("")
@@ -1023,15 +753,6 @@ class Builder:
                     "; ".join(problems[:5]) if problems else "%d debs, %d python dists"
                     % (len(self.deb_records), len(self.wheel_records)))
 
-    def deb_paths(self, deb):
-        proc = run(["dpkg-deb", "--contents", deb], capture=True, quiet=True)
-        paths = []
-        for line in proc.stdout.splitlines():
-            parts = line.split(None, 5)
-            if len(parts) == 6:
-                paths.append(parts[5].split(" -> ")[0])
-        return paths
-
     # -- static checks ---------------------------------------------------
     def static_checks(self):
         shells = sorted(p for p in self.bundle_dir.rglob("*.sh"))
@@ -1046,8 +767,8 @@ class Builder:
         # ShellCheck is a required release check: a missing binary fails the build.
         if not shutil.which("shellcheck"):
             self.record("static: shellcheck (warning level)", False,
-                        "shellcheck not installed in staging; install it (apt-get install shellcheck) "
-                        "or rerun with --install-staging-prereqs")
+                        "shellcheck not installed; install it (Termux: pkg install shellcheck; "
+                        "Debian/Ubuntu: apt-get install shellcheck) or rerun with --install-staging-prereqs")
         proc = run(["shellcheck", "-x", "-S", "warning", *shells], check=False, capture=True)
         if proc.stdout:
             print(proc.stdout, flush=True)
@@ -1063,51 +784,7 @@ class Builder:
                 bad.append("shell=True in %s" % py.name)
         self.record("static: python syntax, no shell=True", not bad, "; ".join(bad) or "%d files" % len(pys))
 
-    # -- offline resolution tests ---------------------------------------
-    def offline_apt_test(self):
-        apt_root = self.staging / "apt-offline-test"
-        repo = self.payload / "debs"
-        sources = ("Types: deb\nURIs: file:%s\nSuites: ./\nTrusted: yes\n" % repo)
-        if " " in str(repo):
-            raise BuildError("staging path must not contain spaces")
-        conf = self.write_apt_config(apt_root, sources, apt_root / "lists", apt_root / "archives")
-        env = self.apt_env(conf, offline=True)
-        run(["apt-get", "update", "-q"], env=env)
-        sim = run(["apt-get", "-s", "-q", "install", "--no-install-recommends", *self.deb_top],
-                  env=env, capture=True, check=False)
-        ok = sim.returncode == 0
-        got = self.parse_apt_sim(sim.stdout) if ok else set()
-        expect = {(r["name"], r["version"], r["arch"]) for r in self.deb_records}
-        self.record("deb: offline resolution from local repo only", ok and got <= expect,
-                    "%d packages for an empty system, all from the bundle" % len(got))
-        everything = sorted(r["name"] for r in self.deb_records)
-        sim = run(["apt-get", "-s", "-q", "install", "--no-install-recommends", *everything],
-                  env=env, capture=True, check=False)
-        got = self.parse_apt_sim(sim.stdout) if sim.returncode == 0 else set()
-        self.record("deb: every bundled package installable offline", got == expect,
-                    "%d/%d" % (len(got), len(expect)))
-        for label, status in getattr(self, "models", []):
-            sim = run(["apt-get", "-s", "-q", "install", "--no-install-recommends", "-o",
-                       "Dir::State::status=%s" % status, *self.deb_top], env=env, capture=True, check=False)
-            if sim.returncode != 0:
-                print(sim.stdout[-3000:], flush=True)
-            self.record("deb: offline resolution, baseline %s" % label,
-                        sim.returncode == 0 and not re.search(r"(?m)^Remv ", sim.stdout),
-                        "%d upgrade(s), %d new" % (len(re.findall(r"(?m)^Inst \S+ \[", sim.stdout)),
-                                                   len(re.findall(r"(?m)^Inst \S+ \(", sim.stdout))))
-        if self.target_state:
-            tstatus = apt_root / "state" / "target-status"
-            shutil.copyfile(self.target_state / "status", tstatus)
-            sim = run(["apt-get", "-s", "-q", "install", "--no-install-recommends", "-o",
-                       "Dir::State::status=%s" % tstatus, *self.deb_top], env=env, capture=True, check=False)
-            if sim.returncode != 0:
-                print(sim.stdout[-3000:], flush=True)
-            self.record("deb: offline resolution against exported target state", sim.returncode == 0
-                        and not re.search(r"(?m)^Remv ", sim.stdout), "")
-        else:
-            self.results.append(("deb: offline resolution against exported target state", "SKIP",
-                                 "no --target-state given"))
-
+    # -- offline resolution test ----------------------------------------
     def offline_pip_test(self):
         """Offline, hash-checked resolution of requirements.lock from the wheelhouse only."""
         dest = self.staging / "pip-offline-test"
@@ -1208,19 +885,52 @@ class Builder:
         proc = run(["tar", "-xzf", self.tar_path, "-C", ext], check=False)
         root = ext / self.bundle_name
         self.record("archive: clean extraction with tar", proc.returncode == 0 and root.is_dir(), "")
-        vproc = run(["./verify.sh"], cwd=root, check=False, capture=True)
-        print(vproc.stdout[-1500:], flush=True)
-        self.record("verify.sh: pass on pristine extraction", vproc.returncode == 0, "")
-        # Negative tests on the throwaway extraction.
+
+        def verify(label, expect_ok):
+            p = run(["bash", "verify.sh"], cwd=root, check=False, capture=True)
+            if expect_ok:
+                print(p.stdout[-1800:], flush=True)
+            ok = (p.returncode == 0) if expect_ok else (p.returncode != 0 and "VERIFY: PASS" not in p.stdout)
+            self.record(label, ok, "exit %d" % p.returncode)
+
+        verify("verify.sh: pass on pristine extraction", True)
+        # Negative tests on the throwaway extraction (each on top of the previous one).
+        sums = (root / "SHA256SUMS").read_text()
         with open(root / "README.md", "ab") as fh:
             fh.write(b"tampered\n")
-        tproc = run(["./verify.sh"], cwd=root, check=False, capture=True)
-        self.record("verify.sh: rejects modified file", tproc.returncode != 0, "exit %d" % tproc.returncode)
+        verify("verify.sh: rejects modified file", False)
+        (root / "README.md").write_bytes(b"")
         victim = sorted((root / "payload" / "wheels").glob("*.whl"))[0]
         victim.unlink()
-        mproc = run(["./verify.sh"], cwd=root, check=False, capture=True)
-        self.record("verify.sh: rejects missing file", mproc.returncode != 0, "exit %d" % mproc.returncode)
+        verify("verify.sh: rejects missing file", False)
+        # A dependency wheel removed consistently from wheelhouse, lock, manifests and
+        # SHA256SUMS: only the dependency-closure check can notice.
         safe_rmtree_child(ext, self.staging)
+        ext.mkdir()
+        run(["tar", "-xzf", self.tar_path, "-C", ext])
+        self.remove_dist_consistently(root, "idna")
+        verify("verify.sh: rejects consistently removed dependency wheel", False)
+        safe_rmtree_child(ext, self.staging)
+        del sums
+
+    @staticmethod
+    def remove_dist_consistently(root, canonical):
+        man = (root / "wheel-manifest.txt").read_text().splitlines()
+        line = next(l for l in man if l.lower().startswith(canonical + " "))
+        fname, digest = line.split()[3], line.split()[4]
+        (root / "payload" / "wheels" / fname).unlink()
+        (root / "wheel-manifest.txt").write_text("\n".join(l for l in man if l != line) + "\n")
+        lock = (root / "requirements.lock").read_text()
+        lock = re.sub(r"(?m)^\S+==\S+ \\\n    --hash=sha256:%s\n" % digest, "", lock)
+        (root / "requirements.lock").write_text(lock)
+        clo = (root / "python-closure.txt").read_text().splitlines()
+        (root / "python-closure.txt").write_text("\n".join(l for l in clo if not l.startswith(canonical + " ")) + "\n")
+        bi = (root / "BUILD_INFO.txt").read_text()
+        n = int(re.search(r"(?m)^WHEEL_COUNT=(\d+)$", bi).group(1))
+        (root / "BUILD_INFO.txt").write_text(re.sub(r"(?m)^WHEEL_COUNT=\d+$", "WHEEL_COUNT=%d" % (n - 1), bi))
+        files = sorted(p for p in root.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+        (root / "SHA256SUMS").write_text("".join("%s  %s\n" % (sha256_file(f), f.relative_to(root).as_posix())
+                                                 for f in files))
 
     def finalize(self):
         digest = sha256_file(self.tar_path)
@@ -1228,42 +938,52 @@ class Builder:
         sha_tmp = self.staging / (name + ".sha256")
         sha_tmp.write_text("%s  %s\n" % (digest, name))
         report = self.staging / ("%s.build-report.txt" % self.bundle_name)
+        skips = [r for r in self.results if r[1] != "PASS"]
         lines = ["Build report for %s" % name, "sha256 %s" % digest,
                  "size_bytes %d" % self.tar_path.stat().st_size, ""]
-        lines += ["%-50s %s %s" % r for r in self.results]
+        lines += ["%-62s %s %s" % r for r in self.results]
         lines += ["", "BUILD_INFO:"] + (self.bundle_dir / "BUILD_INFO.txt").read_text().splitlines()
         report.write_text("\n".join(lines) + "\n")
+        if skips:
+            raise BuildError("non-PASS results: %s" % skips)
         self.dist.mkdir(parents=True, exist_ok=True)
         # Atomic replacement: the previous bundle stays until the new one is validated.
-        for f in (self.tar_path, sha_tmp, report, self.bundle_dir / "wireless-audit.txt"):
-            target = self.dist / (f.name if f.name != "wireless-audit.txt" else
-                                  "%s.wireless-audit.txt" % self.bundle_name)
+        for f in (self.tar_path, sha_tmp, report, self.bundle_dir / "wireless-audit.txt",
+                  self.bundle_dir / "inventory.txt"):
+            target = self.dist / (f.name if f.parent == self.staging else "%s.%s" % (self.bundle_name, f.name))
             tmp = self.dist / (".incoming." + target.name)
             if f.parent == self.staging:
                 os.replace(f, tmp)
             else:
                 shutil.copy2(f, tmp)
             os.replace(tmp, target)
-        log("FINAL ARCHIVE: %s" % (self.dist / name))
-        log("SHA256: %s" % digest)
-        for r in self.results:
-            log("%-50s %s %s" % r)
+        info = dict(l.split("=", 1) for l in (self.bundle_dir / "BUILD_INFO.txt").read_text().splitlines())
+        print("", flush=True)
+        log("=" * 60)
+        log("FINAL ARCHIVE:       %s" % (self.dist / name))
+        log("SHA-256:             %s" % digest)
+        log("SIZE:                %.1f MiB" % ((self.dist / name).stat().st_size / (1 << 20)))
+        log("TARGET:              %s, %s" % (info["TARGET_DISTRIBUTION"], info["DEB_ARCH"]))
+        log("BUILDER:             %s, %s" % (info["BUILDER_ENVIRONMENT"], info["BUILDER_HOST_ARCH"]))
+        log("PYTHON:              %s (pip %s)" % (info["PYTHON_FULL_VERSION"], info["PIP_VERSION"]))
+        log("DEBIAN PACKAGES:     %s" % info["DEB_COUNT"])
+        log("PYTHON WHEELS:       %s (+%s sdist)" % (info["WHEEL_COUNT"], info["SDIST_COUNT"]))
+        log("TESTS:               %d PASS, 0 FAIL, 0 SKIP" % len(self.results))
+        log("=" * 60)
 
     def build(self):
-        if self.target_state_arg:
-            self.target_state = self.load_target_state(Path(self.target_state_arg).resolve())
+        if self.target_state:
+            self.validate_target_state()
         self.check_storage()
         self.make_staging()
         ok = False
         try:
-            self.resolve_debs()
-            self.write_local_repo()
+            self.run_deb_stage()
             self.resolve_wheels()
             self.copy_templates()
             self.write_manifests()
             self.wireless_audit()
             self.static_checks()
-            self.offline_apt_test()
             self.offline_pip_test()
             self.write_sums()
             self.make_tarball()
@@ -1277,37 +997,22 @@ class Builder:
                 log("staging kept for inspection: %s" % self.staging)
 
 
-def safe_rmtree_child(path, parent):
-    path = Path(path)
-    if path.is_symlink() or path.resolve().parent != Path(parent).resolve():
-        raise BuildError("refusing to delete %s" % path)
-    shutil.rmtree(path)
-
-
-def read_os_release():
-    data = {}
-    for line in Path("/etc/os-release").read_text().splitlines():
-        k, sep, v = line.partition("=")
-        if sep:
-            data[k] = v.strip().strip('"')
-    return data
-
-
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description="MADD offline Python bundle builder (orchestrator)")
     ap.add_argument("--output", required=True, help="output directory (cache/, dist/, staging.*)")
     ap.add_argument("--profile", default="mx25-amd64")
+    ap.add_argument("--deb-stage", required=True, help="'local' (Debian/Ubuntu host) or 'proot:NAME' (from Termux)")
+    ap.add_argument("--builder-env", required=True, help="builder environment label (for the manifest)")
     ap.add_argument("--min-free-gb", default="4")
-    ap.add_argument("--debian-keyring", default="")
+    ap.add_argument("--archive-keyring", default="")
     ap.add_argument("--target-state", default="", help="directory from export-target-state.sh")
     ap.add_argument("--skip-baseline-model", action="store_true",
-                    help="do not model un-updated Debian 13.0 targets (not recommended)")
+                    help="do not model un-updated targets (not recommended)")
+    ap.add_argument("--install-staging-prereqs", action="store_true")
     ap.add_argument("--keep-staging", action="store_true")
     ap.add_argument("--check-storage-only", action="store_true")
     ap.add_argument("--in-tools-venv", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
-    if not re.match(r"^[a-z0-9][a-z0-9-]*$", args.profile):
-        raise BuildError("invalid profile name")
     out_dir = Path(args.output).resolve()
     try:
         builder = Builder(args)

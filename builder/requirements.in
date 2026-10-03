@@ -29,6 +29,7 @@ bcrypt
 PyNaCl
 argon2-cffi
 pycryptodome
+paramiko
 
 # HTTP / networking programming (general APIs, not radio management)
 requests
@@ -46,6 +47,8 @@ Jinja2
 python-dateutil
 typing-extensions
 python-dotenv
+# tomllib is in the stdlib from Python 3.11; tomli only for older targets
+tomli; python_version < "3.11"
 
 # System / CLI utilities
 psutil

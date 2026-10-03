@@ -57,7 +57,8 @@ say "Verifying bundle: $BUNDLE_DIR"
 for f in README.md MANIFEST.txt BUILD_INFO.txt profile.conf requirements.in requirements.lock \
          deb-manifest.txt deb-install-list.txt wheel-manifest.txt wireless-audit.txt \
          install.sh verify.sh uninstall-user-env.sh scripts/smoke_test.py scripts/verify_python.py \
-         payload/debs/Packages payload/debs/Packages.gz payload/debs/Release; do
+         inventory.txt python-closure.txt python-top-level.txt \
+         payload/apt/sources.txt payload/apt/preferences; do
     [ -f "$f" ] || fail "missing required file: $f"
 done
 [ "$FAILS" -eq 0 ] && pass "required files present"
@@ -99,7 +100,7 @@ DEB_ARCH=$(kv DEB_ARCH)
 [ -n "$DEB_ARCH" ] || fail "BUILD_INFO.txt lacks DEB_ARCH"
 
 awk 'NR==FNR { sum[$2]=$1; next } /^#/ { next }
-     { p="payload/debs/" $4; if (!(p in sum) || sum[p] != $5) { print "deb-manifest mismatch: " $4; bad=1 } }
+     { p="payload/apt/" $4; if (!(p in sum) || sum[p] != $5) { print "deb-manifest mismatch: " $4; bad=1 } }
      END { exit bad }' "$SUMS_FILE" deb-manifest.txt || fail "deb-manifest.txt disagrees with SHA256SUMS"
 
 awk -v a="$DEB_ARCH" '/^#/ { next } $3 != a && $3 != "all" { print "foreign-architecture deb: " $4; bad=1 } END { exit bad }' \
@@ -120,13 +121,19 @@ else
 fi
 
 # Payload directories contain exactly the manifest files.
-awk '/^#/ { next } { print $4 }' deb-manifest.txt | sort >"$TMPD/debs.man"
-find payload/debs -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort >"$TMPD/debs.dir"
-sed -n 's|^Filename: \./||p' payload/debs/Packages | sort >"$TMPD/debs.idx"
-if cmp -s "$TMPD/debs.man" "$TMPD/debs.dir" && cmp -s "$TMPD/debs.man" "$TMPD/debs.idx"; then
-    pass "local APT repository index matches $(wc -l <"$TMPD/debs.man") .deb files"
+awk '/^#/ { next } { print $1 }' deb-manifest.txt | sort >"$TMPD/debs.man"
+find payload/apt -type f -name '*.deb' -printf '%P\n' | sort >"$TMPD/debs.dir"
+awk '/^#/ { next } { print $4 }' deb-manifest.txt | sort >"$TMPD/debs.paths"
+if [ -n "$(comm -13 "$TMPD/debs.dir" "$TMPD/debs.paths")" ]; then
+    fail "deb-manifest.txt lists .deb files missing from payload/apt"
+fi
+# Extra .deb copies are allowed only as duplicates (same file name) of manifest entries,
+# for packages that more than one bundled suite lists.
+sed 's|.*/||' "$TMPD/debs.paths" | sort -u >"$TMPD/debs.names"
+if [ -n "$(sed 's|.*/||' "$TMPD/debs.dir" | sort -u | comm -13 "$TMPD/debs.names" -)" ]; then
+    fail "payload/apt contains .deb files not listed in deb-manifest.txt"
 else
-    fail "payload/debs, Packages index, and deb-manifest.txt disagree"
+    pass "APT payload holds exactly the $(wc -l <"$TMPD/debs.man") manifest packages"
 fi
 awk '/^#/ { next } $3 == "wheel" { print $4 }' wheel-manifest.txt | sort >"$TMPD/whl.man"
 find payload/wheels -maxdepth 1 -type f -printf '%f\n' | sort >"$TMPD/whl.dir"
@@ -135,19 +142,37 @@ awk '/^#/ { next } $3 == "sdist" { print $4 }' wheel-manifest.txt | sort >"$TMPD
 find payload/sdists -maxdepth 1 -type f -printf '%f\n' | sort >"$TMPD/sd.dir"
 cmp -s "$TMPD/sd.man" "$TMPD/sd.dir" || fail "payload/sdists does not match wheel-manifest.txt"
 
-# Package index SHA256 values must match the files (APT re-checks this too).
-awk '/^Filename: / { f=$2; sub(/^\.\//, "", f) } /^SHA256: / { print $2 "  payload/debs/" f }' \
-    payload/debs/Packages >"$TMPD/idx.sums"
-if (sha256sum --check --strict --quiet -- "$TMPD/idx.sums") >/dev/null 2>&1; then
-    pass "Packages index SHA256 fields match .deb files"
+# Signed APT metadata present for every bundled suite; pins allow exactly the manifest versions.
+while read -r rid suite comps; do
+    [ -f "payload/apt/$rid/dists/$suite/InRelease" ] || fail "missing signed InRelease for $rid $suite"
+    for c in $comps; do
+        [ -f "payload/apt/$rid/dists/$suite/$c/binary-$(kv DEB_ARCH)/Packages.xz" ] ||
+            fail "missing package index for $rid $suite $c"
+    done
+done <payload/apt/sources.txt
+awk '/^Package: / { p=$2 } /^Pin: version / { print p " " $3 }' payload/apt/preferences | sort >"$TMPD/pins"
+awk '/^#/ { next } { print $1 " " $2 }' deb-manifest.txt | sort >"$TMPD/manver"
+if cmp -s "$TMPD/pins" "$TMPD/manver"; then
+    pass "APT pins allow exactly the bundled package versions"
 else
-    fail "Packages index SHA256 fields do not match .deb files"
+    fail "payload/apt/preferences does not match deb-manifest.txt"
 fi
-for idx in Packages Packages.gz; do
-    want=$(awk -v n="$idx" '$3 == n { print $1 }' payload/debs/Release)
-    got=$(sha256sum -- "payload/debs/$idx" | awk '{ print $1 }')
-    if [ -z "$want" ] || [ "$want" != "$got" ]; then fail "Release hash mismatch for $idx"; fi
-done
+
+# Python dependency closure: every mandatory top-level package and every
+# dependency of every bundled distribution must itself be bundled.
+awk '/^#/ { next } { print $3 }' python-closure.txt | sort >"$TMPD/closurehashes"
+cmp -s "$TMPD/closurehashes" "$TMPD/lockhashes" || fail "python-closure.txt does not match requirements.lock"
+awk '/^#/ { next } { print $1 }' python-closure.txt | sort -u >"$TMPD/have"
+{
+    cat python-top-level.txt
+    awk '/^#/ || $4 == "-" { next } { n = split($4, d, ","); for (i = 1; i <= n; i++) print d[i] }' python-closure.txt
+} | sort -u >"$TMPD/need"
+missing_py=$(comm -23 "$TMPD/need" "$TMPD/have")
+if [ -n "$missing_py" ]; then
+    fail "mandatory Python distributions missing from the wheelhouse: $(printf '%s' "$missing_py" | tr '\n' ' ')"
+else
+    pass "Python dependency closure complete ($(wc -l <python-top-level.txt) top-level, $(wc -l <"$TMPD/have") total)"
+fi
 
 # 6. Counts declared in BUILD_INFO.txt.
 [ "$(kv DEB_COUNT)" = "$(wc -l <"$TMPD/debs.man" | tr -d ' ')" ] || fail "DEB_COUNT mismatch"
@@ -170,7 +195,7 @@ grep -q '^RESULT: PASS$' wireless-audit.txt || fail "wireless-audit.txt does not
 
 say ""
 say "Bundle:  $(kv BUNDLE_NAME)  built $(kv BUILD_DATE_UTC)"
-say "Target:  $(kv TARGET_DISTRIBUTION) / Debian $(kv DEBIAN_VERSION) ($(kv DEBIAN_CODENAME)) $(kv DEB_ARCH)"
+say "Target:  $(kv TARGET_DISTRIBUTION), $(kv DEB_ARCH) (built on $(kv BUILDER_HOST_ARCH): $(kv BUILDER_ENVIRONMENT))"
 say "Python:  $(kv PYTHON_FULL_VERSION) ($(kv PYTHON_ABI)), Debian package $(kv PYTHON_DEB_VERSION)"
 if command -v dpkg >/dev/null 2>&1; then
     say "This machine: dpkg architecture $(dpkg --print-architecture), uname -m $(uname -m)"

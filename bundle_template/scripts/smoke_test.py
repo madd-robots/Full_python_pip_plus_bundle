@@ -16,7 +16,7 @@ IMPORTS = [
     "tkinter", "ssl", "sqlite3", "ctypes", "hashlib", "hmac", "secrets",
     "numpy", "scipy", "pandas", "matplotlib", "PIL", "cryptography", "OpenSSL",
     "bcrypt", "nacl", "Crypto", "requests", "httpx", "yaml", "psutil", "rich",
-    "pytest", "serial",
+    "pytest", "serial", "paramiko", "cffi",
     # remaining top-level packages from requirements.in
     "pip", "setuptools", "wheel", "virtualenv", "packaging", "build", "piptools",
     "setuptools_scm", "platformdirs", "filelock", "cffi", "pycparser", "argon2",
@@ -106,6 +106,24 @@ def t_crypto():
     return "Fernet, AES-GCM, NaCl, PyCryptodome, bcrypt, argon2 (in-memory keys)"
 
 
+def t_paramiko_cffi():
+    import cffi
+    import paramiko
+    key = paramiko.ECDSAKey.generate(bits=256)  # in memory only; never written to disk
+    msg = paramiko.Message()
+    msg.add_string("madd-python")
+    sig = key.sign_ssh_data(msg.asbytes())
+    sig.rewind()
+    if not key.verify_ssh_sig(msg.asbytes(), sig):
+        raise RuntimeError("paramiko ECDSA signature did not verify")
+    ffi = cffi.FFI()
+    ffi.cdef("size_t strlen(const char *);")
+    libc = ffi.dlopen(None)
+    if libc.strlen(b"madd") != 4:
+        raise RuntimeError("cffi call failed")
+    return "paramiko %s ECDSA sign/verify; cffi %s libc call" % (paramiko.__version__, cffi.__version__)
+
+
 def t_requests_ca():
     import ssl
     import certifi
@@ -144,6 +162,7 @@ def main():
         ("numpy/scipy/pandas", t_numpy_scipy_pandas),
         ("matplotlib/Pillow", t_matplotlib_pillow),
         ("cryptography stack", t_crypto),
+        ("paramiko/cffi", t_paramiko_cffi),
         ("requests/httpx/CA", t_requests_ca),
         ("yaml/rich/psutil/serial", t_misc),
     ]:

@@ -91,14 +91,20 @@ BI="$BUNDLE_DIR/BUILD_INFO.txt"
 BUNDLE_NAME=$(kv BUNDLE_NAME "$BI")
 WANT_ARCH=$(kv DEB_ARCH "$BI")
 WANT_MACHINE=$(kv UNAME_MACHINE "$BI")
-WANT_DEBIAN=$(kv DEBIAN_VERSION "$BI")
-WANT_CODENAME=$(kv DEBIAN_CODENAME "$BI")
+WANT_FAMILY=$(kv TARGET_FAMILY "$BI")
+WANT_OS_ID=$(kv TARGET_OS_ID "$BI")
+WANT_VERSION_ID=$(kv TARGET_VERSION_ID "$BI")
+WANT_CODENAME=$(kv TARGET_CODENAME "$BI")
+WANT_MX=$(kv TARGET_MX_RELEASE "$BI")
+TARGET_NAME=$(kv TARGET_DISTRIBUTION "$BI")
+TARGET_KEYRING=$(kv TARGET_KEYRING "$BI")
 PY_SHORT=$(kv PYTHON_VERSION "$BI")
-DEB_BYTES=$(kv DEB_TOTAL_BYTES "$BI")
+DEB_BYTES=$(kv APT_PAYLOAD_BYTES "$BI")
 DEB_KB=$(kv DEB_INSTALLED_SIZE_KB "$BI")
 PYDIST_BYTES=$(kv PYDIST_TOTAL_BYTES "$BI")
 SDIST_COUNT=$(kv SDIST_COUNT "$BI")
-for v in BUNDLE_NAME WANT_ARCH WANT_MACHINE WANT_DEBIAN WANT_CODENAME PY_SHORT DEB_BYTES DEB_KB PYDIST_BYTES SDIST_COUNT; do
+for v in BUNDLE_NAME WANT_ARCH WANT_MACHINE WANT_FAMILY WANT_OS_ID WANT_VERSION_ID WANT_CODENAME TARGET_NAME \
+         TARGET_KEYRING PY_SHORT DEB_BYTES DEB_KB PYDIST_BYTES SDIST_COUNT; do
     [ -n "${!v}" ] || die "BUILD_INFO.txt is incomplete ($v)"
 done
 for v in DEB_BYTES DEB_KB PYDIST_BYTES SDIST_COUNT; do
@@ -109,11 +115,12 @@ mapfile -t DEB_PKGS < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$BUNDLE_DIR/deb
 for p in "${DEB_PKGS[@]}"; do
     [[ "$p" =~ ^[a-z0-9][a-z0-9.+-]*$ ]] || die "invalid package name in deb-install-list.txt: $p"
 done
-info "bundle $BUNDLE_NAME: Debian $WANT_DEBIAN ($WANT_CODENAME) $WANT_ARCH, Python $PY_SHORT"
+case "$TARGET_KEYRING" in /usr/share/keyrings/*.gpg) ;; *) die "unexpected TARGET_KEYRING in BUILD_INFO.txt" ;; esac
+info "bundle $BUNDLE_NAME: $TARGET_NAME, $WANT_ARCH, Python $PY_SHORT"
 
 # --------------------------------------------------------------------------
 section "Preflight: required commands"
-NEED=(sha256sum awk sed grep sort find comm cmp df stat id getent mktemp cp uname dpkg dpkg-query)
+NEED=(sha256sum awk sed grep sort find comm cmp df stat id getent mktemp cp uname readlink dpkg dpkg-query)
 [ "$SKIP_SYSTEM" -eq 1 ] || NEED+=(apt-get)
 [ "$(id -u)" -ne 0 ] || NEED+=(runuser)
 for cmd in "${NEED[@]}"; do
@@ -126,7 +133,6 @@ section "Preflight: operating system and architecture"
 [ -r /etc/os-release ] || die "/etc/os-release not found; unsupported system"
 osr() { sed -n "s/^$1=//p" /etc/os-release | head -n 1 | sed -e 's/^"//' -e 's/"$//'; }
 OS_ID=$(osr ID)
-OS_LIKE=$(osr ID_LIKE)
 OS_VERSION_ID=$(osr VERSION_ID)
 OS_CODENAME=$(osr VERSION_CODENAME)
 DEB_VERSION_FILE=""
@@ -134,26 +140,39 @@ DEB_VERSION_FILE=""
 MX_VERSION=""
 [ -r /etc/mx-version ] && MX_VERSION=$(head -n 1 /etc/mx-version)
 
-case " $OS_ID $OS_LIKE " in
-    *" debian "*) ;;
-    *) die "not a Debian-family system (ID=$OS_ID); this bundle targets MX Linux 25 / Debian 13" ;;
-esac
 DEB_MAJOR=${DEB_VERSION_FILE%%.*}
-if [ "$DEB_MAJOR" != "$WANT_DEBIAN" ] && [ "$OS_VERSION_ID" != "$WANT_DEBIAN" ]; then
-    die "Debian base mismatch: /etc/debian_version='$DEB_VERSION_FILE' VERSION_ID='$OS_VERSION_ID'; bundle requires Debian $WANT_DEBIAN"
-fi
-if [ -n "$OS_CODENAME" ] && [ "$OS_CODENAME" != "$WANT_CODENAME" ]; then
-    die "codename mismatch: system '$OS_CODENAME', bundle '$WANT_CODENAME'"
-fi
-if [ -n "$MX_VERSION" ]; then
-    case "$MX_VERSION" in
-        MX-25*) PROFILE_MATCH="MX Linux 25 ($MX_VERSION)" ;;
-        *) die "unsupported MX release '$MX_VERSION'; this bundle is for MX Linux 25 (Debian $WANT_DEBIAN)" ;;
-    esac
-else
-    # Explicit compatible profile: plain Debian 13 is MX 25's base distribution.
-    PROFILE_MATCH="Debian $WANT_DEBIAN ($WANT_CODENAME) - compatible base of MX Linux 25"
-fi
+case "$WANT_FAMILY" in
+    debian)
+        # MX Linux keeps Debian's base files; identify it by /etc/mx-version.
+        if [ -n "$MX_VERSION" ]; then
+            [ -n "$WANT_MX" ] || die "MX Linux detected ($MX_VERSION) but this bundle is for $TARGET_NAME"
+            case "$MX_VERSION" in
+                "$WANT_MX"*) PROFILE_MATCH="MX Linux ($MX_VERSION) on Debian $DEB_VERSION_FILE" ;;
+                *) die "unsupported MX release '$MX_VERSION'; this bundle is for $TARGET_NAME" ;;
+            esac
+            [ "$DEB_MAJOR" = "$WANT_VERSION_ID" ] ||
+                die "MX base is Debian '$DEB_VERSION_FILE'; this bundle requires Debian $WANT_VERSION_ID"
+        else
+            [ "$OS_ID" = "$WANT_OS_ID" ] || die "unsupported distribution ID=$OS_ID; this bundle is for $TARGET_NAME"
+            if [ "$DEB_MAJOR" != "$WANT_VERSION_ID" ] && [ "$OS_VERSION_ID" != "$WANT_VERSION_ID" ]; then
+                die "Debian base mismatch: /etc/debian_version='$DEB_VERSION_FILE' VERSION_ID='$OS_VERSION_ID'; bundle requires Debian $WANT_VERSION_ID"
+            fi
+            if [ -n "$OS_CODENAME" ] && [ "$OS_CODENAME" != "$WANT_CODENAME" ]; then
+                die "codename mismatch: system '$OS_CODENAME', bundle '$WANT_CODENAME'"
+            fi
+            PROFILE_MATCH="Debian $WANT_VERSION_ID ($WANT_CODENAME)"
+        fi
+        ;;
+    ubuntu)
+        [ -z "$MX_VERSION" ] || die "MX Linux detected; this bundle is for $TARGET_NAME"
+        [ "$OS_ID" = "$WANT_OS_ID" ] || die "unsupported distribution ID=$OS_ID; this bundle is for $TARGET_NAME"
+        [ "$OS_VERSION_ID" = "$WANT_VERSION_ID" ] ||
+            die "Ubuntu release mismatch: VERSION_ID='$OS_VERSION_ID'; bundle requires $WANT_VERSION_ID"
+        [ "$OS_CODENAME" = "$WANT_CODENAME" ] || die "codename mismatch: system '$OS_CODENAME', bundle '$WANT_CODENAME'"
+        PROFILE_MATCH="Ubuntu $WANT_VERSION_ID ($WANT_CODENAME)"
+        ;;
+    *) die "unknown target family '$WANT_FAMILY' in BUILD_INFO.txt" ;;
+esac
 SYS_ARCH=$(dpkg --print-architecture)
 SYS_MACHINE=$(uname -m)
 [ "$SYS_ARCH" = "$WANT_ARCH" ] || die "architecture mismatch: system dpkg architecture '$SYS_ARCH', bundle '$WANT_ARCH'"
@@ -260,7 +279,7 @@ for p in "${DEB_PKGS[@]}"; do
 done
 command -v python3 >/dev/null 2>&1 && info "current system python3: $(python3 --version 2>&1)"
 if [ -e "$VENV" ]; then
-    if [ -f "$VENV/.madd-python-bundle" ]; then
+    if [ -f "$VENV/.madd-python-bundle" ] && [ "$(head -n 1 "$VENV/.madd-python-bundle")" = madd-python-bundle ]; then
         info "existing environment from this project found at $VENV (will be updated in place)"
     else
         die "$VENV exists but was not created by this bundle; it will not be touched. Use --venv to choose another location."
@@ -280,16 +299,40 @@ apt_local() {
 
 if [ "$SKIP_SYSTEM" -eq 0 ]; then
     section "Preflight: private local APT repository"
-    mkdir -p "$REPO" "$WORK/lists/partial" "$WORK/archives/partial" "$WORK/sources.list.d" "$WORK/preferences.d"
+    # The trust root is this system's own installed archive keyring (Debian 13
+    # ships it as a symlink to a .pgp file): resolve it and require a root-owned
+    # regular file under /usr/share/keyrings.
+    KEYRING_REAL=$(readlink -f -- "$TARGET_KEYRING" 2>/dev/null || true)
+    case "$KEYRING_REAL" in
+        /usr/share/keyrings/*) ;;
+        *) die "archive keyring $TARGET_KEYRING not found on this system; it is needed to verify the bundled package metadata" ;;
+    esac
+    if [ ! -f "$KEYRING_REAL" ] || [ "$(stat -c %u -- "$KEYRING_REAL")" != 0 ]; then
+        die "archive keyring $KEYRING_REAL is missing or not owned by root"
+    fi
+    mkdir -p "$WORK/lists/partial" "$WORK/archives/partial" "$WORK/sources.list.d" "$WORK/preferences.d"
     # Copy the repository into a private directory and re-verify the copy, so
     # files in a user-writable bundle cannot be swapped after verification.
-    cp -- "$BUNDLE_DIR"/payload/debs/* "$REPO/"
-    awk '$2 ~ /^payload\/debs\// { sub(/^payload\/debs\//, "", $2); print $1 "  " $2 }' "$WORK/SHA256SUMS" >"$WORK/repo.sums"
+    cp -R -- "$BUNDLE_DIR/payload/apt" "$REPO"
+    awk '$2 ~ /^payload\/apt\// { sub(/^payload\/apt\//, "", $2); print $1 "  " $2 }' "$WORK/SHA256SUMS" >"$WORK/repo.sums"
     ( cd -- "$REPO" && sha256sum --check --strict --quiet -- "$WORK/repo.sums" ) ||
         die "private repository copy failed verification"
-    [ "$(find "$REPO" -maxdepth 1 -type f | wc -l)" -eq "$(wc -l <"$WORK/repo.sums")" ] ||
+    [ "$(find "$REPO" -type f | wc -l)" -eq "$(wc -l <"$WORK/repo.sums")" ] ||
         die "private repository copy contains unexpected files"
-    printf 'deb [trusted=yes] file:%s ./\n' "$REPO" >"$WORK/sources.list"
+    [ -z "$(find "$REPO" ! -type f ! -type d)" ] || die "private repository copy contains special files"
+    # Bundled metadata is the archive's own signed InRelease, verified below by APT
+    # with this system's keyring. Valid-Until (freshness) cannot apply to an
+    # intentionally frozen offline snapshot, so only that check is relaxed, and
+    # only for these local sources.
+    : >"$WORK/sources.list"
+    while read -r rid suite comps; do
+        if ! [[ "$rid" =~ ^[a-z0-9-]+$ && "$suite" =~ ^[A-Za-z0-9._-]+$ && "$comps" =~ ^[a-z0-9\ -]+$ ]]; then
+            die "malformed payload/apt/sources.txt"
+        fi
+        printf 'Types: deb\nURIs: file:%s/%s\nSuites: %s\nComponents: %s\nArchitectures: %s\nSigned-By: %s\nTargets: Packages\nCheck-Valid-Until: no\n\n' \
+            "$REPO" "$rid" "$suite" "$comps" "$WANT_ARCH" "$KEYRING_REAL" >>"$WORK/sources.list.d/madd.sources"
+    done <"$REPO/sources.txt"
+    cp -- "$REPO/preferences" "$WORK/preferences.d/madd.pref"
     cat >"$APT_CONF" <<EOF
 Dir::Etc::sourcelist "$WORK/sources.list";
 Dir::Etc::sourceparts "$WORK/sources.list.d/";
@@ -303,6 +346,7 @@ APT::Install-Recommends "false";
 APT::Install-Suggests "false";
 APT::Get::List-Cleanup "false";
 Acquire::Languages "none";
+Acquire::By-Hash "no";
 Acquire::http::Proxy "http://127.0.0.1:9";
 Acquire::https::Proxy "http://127.0.0.1:9";
 #clear APT::Update::Pre-Invoke;
@@ -313,7 +357,7 @@ EOF
     if grep -E '^(Err|W:|E:)' "$WORK/update.log" >&2; then
         die "local repository index produced errors/warnings"
     fi
-    info "local repository: $(grep -c '^Package: ' "$REPO/Packages") packages indexed, no network sources configured"
+    info "local repository: signatures verified with $KEYRING_REAL; $(awk '!/^#/' "$BUNDLE_DIR/deb-manifest.txt" | wc -l) bundled packages; no network sources configured"
 
     section "Preflight: dependency resolution simulation (no changes)"
     sim_rc=0
@@ -325,6 +369,14 @@ EOF
     if grep -q '^Remv ' "$WORK/sim.log"; then
         grep '^Remv ' "$WORK/sim.log" >&2
         die "resolution would remove packages; refusing"
+    fi
+    # Every package APT plans to install must be a bundled artifact.
+    awk '/^#/ { next } { print $1 " " $2 }' "$BUNDLE_DIR/deb-manifest.txt" | sort >"$WORK/bundled.lst"
+    sed -n 's/^Inst \([^ ]*\) \(\[[^]]*\] \)\{0,1\}(\([^ ]*\) .*/\1 \3/p' "$WORK/sim.log" | sed 's/:[a-z0-9]* / /' | sort >"$WORK/planned.lst"
+    notbundled=$(comm -23 "$WORK/planned.lst" "$WORK/bundled.lst")
+    if [ -n "$notbundled" ]; then
+        printf '%s\n' "$notbundled" >&2
+        die "APT would need package versions that are not in this bundle (listed above); no changes were made"
     fi
     N_NEW=$(grep -c '^Inst [^ ]* (' "$WORK/sim.log" || true)
     N_UPG=$(grep -c '^Inst [^ ]* \[' "$WORK/sim.log" || true)
@@ -380,6 +432,9 @@ FIND_LINKS=(--find-links "$BUNDLE_DIR/payload/wheels")
 if [ ! -e "$VENV" ]; then
     as_user mkdir -p -- "$(dirname -- "$VENV")"
     as_user "/usr/bin/python$PY_SHORT" -m venv -- "$VENV"
+    # Marker first: identifies this environment as ours even if a later step fails.
+    printf 'madd-python-bundle\nbundle=%s\nstatus=incomplete\n' "$BUNDLE_NAME" |
+        as_user tee -- "$VENV/.madd-python-bundle" >/dev/null
     info "created $VENV"
 fi
 [ -x "$VENV/bin/python" ] || die "environment python missing at $VENV/bin/python"
@@ -387,7 +442,7 @@ as_user "$VENV/bin/python" -m pip install --isolated --no-index --no-cache-dir -
     --require-hashes "${FIND_LINKS[@]}" -r "$BUNDLE_DIR/requirements.lock"
 as_user "$VENV/bin/python" -m pip check
 LOCK_SHA=$(sha256sum -- "$BUNDLE_DIR/requirements.lock" | awk '{ print $1 }')
-printf 'madd-python-bundle\nbundle=%s\nlock_sha256=%s\ninstalled_utc=%s\n' \
+printf 'madd-python-bundle\nbundle=%s\nstatus=complete\nlock_sha256=%s\ninstalled_utc=%s\n' \
     "$BUNDLE_NAME" "$LOCK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" |
     as_user tee -- "$VENV/.madd-python-bundle" >/dev/null
 info "environment ready: $VENV"
@@ -431,6 +486,7 @@ if [ "$NO_LAUNCHERS" -eq 0 ] && [ -x "$BIN_DIR/madd-python" ]; then
     as_user "$BIN_DIR/madd-python" --version || SMOKE_FAIL=1
 fi
 as_user "$VENV/bin/python" -m pip --version || SMOKE_FAIL=1
+as_user /usr/bin/python3 -c 'import tkinter; print("python3 -c \"import tkinter\": OK, Tk", tkinter.TkVersion)' || SMOKE_FAIL=1
 info "system python3 standard-library checks:"
 as_user /usr/bin/python3 -B "$BUNDLE_DIR/scripts/verify_python.py" || SMOKE_FAIL=1
 info "environment checks:"
