@@ -1,18 +1,26 @@
-# madd-python-full offline bundle (MX Linux 25 / Debian 13, amd64)
+# madd-python-full offline bundle
 
 A self-contained, offline Python development toolchain for an air-gapped
-MX Linux 25.x (Debian 13 "trixie") amd64 machine. Nothing is downloaded at
-install time.
+amd64 machine. Nothing is downloaded at install time. Each bundle is built for
+one target, named in BUILD_INFO.txt (TARGET_DISTRIBUTION):
+
+* `madd-python-full-mx25-amd64`: MX Linux 25.x or Debian 13 "trixie"
+  (Python 3.13)
+* `madd-python-full-ubuntu2404-amd64`: Ubuntu 24.04 LTS "noble" (Python 3.12)
+
+install.sh refuses any other distribution, release, or architecture.
 
 ## What is inside
 
 | Item | Content |
 |------|---------|
-| payload/debs/ | Debian 13 amd64/all .deb files with a local APT repository index (Packages, Packages.gz, Release): python3, python3-full, -dev, -venv, -pip, -tk, setuptools, wheel, build-essential, gcc/g++/make/pkgconf, SSL/FFI/zlib/bz2/lzma/sqlite/readline/ncurses/gdbm/Tcl/Tk headers, ca-certificates, and their full dependency closure |
-| payload/wheels/ | Complete hash-pinned wheelhouse (pip, numpy, scipy, pandas, matplotlib, cryptography, requests, pytest, ... and every dependency) for CPython 3.13 linux x86_64 |
+| payload/apt/ | A signed slice of the distribution archive. Each suite's own signed InRelease and Packages.xz are included exactly as published; only the bundled .deb files are present. Contents: python3, python3-full, -dev, -venv, -pip, -tk, setuptools, wheel, build-essential, gcc/g++/make/pkgconf, SSL/FFI/zlib/bz2/lzma/sqlite/readline/ncurses/gdbm/Tcl/Tk headers, ca-certificates, and their full dependency closure. `preferences` pins APT to exactly the bundled versions. |
+| payload/wheels/ | Complete hash-pinned wheelhouse for the target's CPython on linux x86_64: pip, numpy, scipy, pandas, matplotlib, cryptography, PyNaCl, bcrypt, paramiko, requests, pytest, and every dependency |
 | payload/sdists/ | Source fallbacks (empty unless BUILD_INFO.txt SDIST_COUNT > 0) |
 | requirements.in / requirements.lock | Requested packages / frozen versions with SHA-256 |
-| deb-manifest.txt / wheel-manifest.txt | Every artifact: name, version, architecture/tags, filename, SHA-256 |
+| deb-manifest.txt / wheel-manifest.txt | Every artifact: name, version, architecture/tags, path, SHA-256 |
+| python-closure.txt / python-top-level.txt | Dependency graph of the wheelhouse with target markers applied; verify.sh uses it to prove no mandatory wheel is missing |
+| inventory.txt | Human-readable summary: target and builder architecture and environment, Python/pip versions, every package with version and SHA-256 |
 | BUILD_INFO.txt | Target profile, Python version/ABI, glibc, counts, build date |
 | wireless-audit.txt | What was checked to exclude Bluetooth/Wi-Fi/cellular packages, and the result |
 | SHA256SUMS / MANIFEST.txt | Checksums and inventory of every file |
@@ -44,9 +52,17 @@ question). `./install.sh --preflight-only` runs the checks alone, without root.
 
 * Copies the package repository into a private root-owned directory under
   /var/tmp, re-verifies its hashes, and points a temporary APT configuration
-  (passed with `apt-get -c`) at that `file:` repository only. Your
-  /etc/apt/sources.list, sources.list.d, pins, and MX repository settings are
-  not read or modified, and no network source is configured.
+  (passed with `apt-get -c`) at those `file:` sources only. APT verifies the
+  bundled InRelease signatures with this machine's own installed archive
+  keyring (/usr/share/keyrings/debian-archive-keyring.gpg or
+  ubuntu-archive-keyring.gpg). Nothing is marked trusted.
+* The archive's Valid-Until freshness date is not enforced for these local
+  sources only, because an offline snapshot is used after the date has passed.
+  Signatures and hashes are still enforced.
+* Your /etc/apt/sources.list, sources.list.d, pins, and MX repository settings
+  are not read or modified, and no network source is configured. Before
+  changing anything, the installer checks that every package APT plans to
+  install is a bundled artifact.
 * Installs only the packages in deb-install-list.txt and the dependencies they
   require. It never runs upgrade/full-upgrade/dist-upgrade and aborts if any
   package would be removed. Bundled versions are installed only where needed.

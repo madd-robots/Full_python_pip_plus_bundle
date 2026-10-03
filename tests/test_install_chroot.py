@@ -89,25 +89,57 @@ def set_kv(path, key, value):
 
 
 def remove_deb(bundle, pkg):
-    """Drop one dependency from a bundle copy and make all metadata consistent again."""
-    debs = bundle / "payload/debs"
-    stanzas = debs.joinpath("Packages").read_text().strip("\n").split("\n\n")
-    keep = [s for s in stanzas if not re.search(r"(?m)^Package: %s$" % re.escape(pkg), s)]
-    gone = [s for s in stanzas if s not in keep]
-    assert len(gone) == 1, pkg
-    fname = re.search(r"(?m)^Filename: \./(.+)$", gone[0]).group(1)
-    (debs / fname).unlink()
-    body = "\n\n".join(keep) + "\n"
-    (debs / "Packages").write_text(body)
-    with gzip.open(debs / "Packages.gz", "wb") as gz:
-        gz.write(body.encode())
-    rel = (debs / "Release").read_text().split("SHA256:")[0]
-    rel += "SHA256:\n" + "".join(" %s %d %s\n" % (sha(debs / n), (debs / n).stat().st_size, n)
-                                 for n in ("Packages", "Packages.gz"))
-    (debs / "Release").write_text(rel)
+    """Drop one dependency from a bundle copy and make all bundle metadata consistent again.
+
+    The archive-signed Packages.xz still lists the package, but the pins only
+    allow bundled versions, so APT must find it unresolvable.
+    """
     man = bundle / "deb-manifest.txt"
-    man.write_text("".join(l for l in man.read_text().splitlines(True) if not l.startswith(pkg + " ")))
-    set_kv(bundle / "BUILD_INFO.txt", "DEB_COUNT", str(len(keep)))
+    lines = man.read_text().splitlines(True)
+    victim = [l for l in lines if l.startswith(pkg + " ")]
+    assert len(victim) == 1, pkg
+    fname = Path(victim[0].split()[3]).name
+    for f in (bundle / "payload/apt").rglob(fname):
+        f.unlink()
+    man.write_text("".join(l for l in lines if l not in victim))
+    prefs = bundle / "payload/apt/preferences"
+    prefs.write_text(re.sub(r"(?m)^Package: %s\nPin: version \S+\nPin-Priority: 500\n\n?" % re.escape(pkg), "",
+                            prefs.read_text()))
+    n = sum(1 for l in man.read_text().splitlines() if not l.startswith("#"))
+    set_kv(bundle / "BUILD_INFO.txt", "DEB_COUNT", str(n))
+    regen_sums(bundle)
+
+
+def remove_wheel(bundle, canonical, hide_from_closure=False):
+    """Remove one Python distribution consistently from wheelhouse, lock, manifests.
+
+    With hide_from_closure the dependency lists are scrubbed too, so verify.sh
+    passes and only pip itself (offline, --no-index) can notice.
+    """
+    man = (bundle / "wheel-manifest.txt").read_text().splitlines()
+    line = next(l for l in man if l.lower().startswith(canonical + " "))
+    fname, digest = line.split()[3], line.split()[4]
+    (bundle / "payload/wheels" / fname).unlink()
+    (bundle / "wheel-manifest.txt").write_text("\n".join(l for l in man if l != line) + "\n")
+    lock = bundle / "requirements.lock"
+    lock.write_text(re.sub(r"(?m)^\S+==\S+ \\\n    --hash=sha256:%s\n" % digest, "", lock.read_text()))
+    clo = [l for l in (bundle / "python-closure.txt").read_text().splitlines() if not l.startswith(canonical + " ")]
+    if hide_from_closure:
+        fixed = []
+        for l in clo:
+            parts = l.split()
+            if not l.startswith("#") and len(parts) == 4:
+                deps = [d for d in parts[3].split(",") if d != canonical]
+                parts[3] = ",".join(deps) or "-"
+                l = " ".join(parts)
+            fixed.append(l)
+        clo = fixed
+        top = bundle / "python-top-level.txt"
+        top.write_text("".join(n + "\n" for n in top.read_text().split() if n != canonical))
+    (bundle / "python-closure.txt").write_text("\n".join(clo) + "\n")
+    bi = (bundle / "BUILD_INFO.txt").read_text()
+    n = int(re.search(r"(?m)^WHEEL_COUNT=(\d+)$", bi).group(1))
+    set_kv(bundle / "BUILD_INFO.txt", "WHEEL_COUNT", str(n - 1))
     regen_sums(bundle)
 
 
@@ -117,6 +149,7 @@ def main():
     ap.add_argument("--tarball", required=True)
     ap.add_argument("--use-sudo", action="store_true", help="invoke install.sh through sudo as the test user")
     ap.add_argument("--gui", action="store_true", help="start Xvfb in the chroot for the Tk display test")
+    ap.add_argument("--foreign-tarball", help="bundle for another distribution; must be refused here")
     args = ap.parse_args()
 
     tarball = Path(args.tarball).resolve()
@@ -166,7 +199,7 @@ def main():
             return dst, "/home/%s/%s" % (USER, dst.name)
 
         hc, cb = copy("corrupt")
-        victim = sorted((hc / "payload/debs").glob("libmpc3_*.deb"))[0]
+        victim = sorted((hc / "payload/apt").rglob("libmpc3_*.deb"))[0]
         data = bytearray(victim.read_bytes())
         data[-100] ^= 0xFF
         victim.write_bytes(bytes(data))
@@ -187,26 +220,69 @@ def main():
         record("reject: missing dependency (consistent bundle, APT simulation)",
                vrc == 0 and rc != 0 and "dependency resolution failed" in out and "libmpc3" in out)
 
-        osr = ch.root / "etc/os-release"
-        osr_orig = osr.read_text() if not osr.is_symlink() else None
-        real_osr = osr.resolve()
+        hp, pb = copy("missingwheel")
+        remove_wheel(hp, "idna")
+        rc, out = ch.run([pb + "/install.sh", "--preflight-only", "--target-user", USER])
+        record("reject: missing mandatory wheel (closure check)",
+               rc != 0 and "missing from the wheelhouse: idna" in out and "integrity check failed" in out)
+
+        family = re.search(r"(?m)^TARGET_FAMILY=(\S+)$", (hb / "BUILD_INFO.txt").read_text()).group(1)
+        real_osr = (ch.root / "etc/os-release").resolve()
         saved = real_osr.read_text()
-        real_osr.write_text(saved.replace('VERSION_ID="13"', 'VERSION_ID="12"').replace("trixie", "bookworm"))
         dv = ch.root / "etc/debian_version"
         dv_saved = dv.read_text()
-        dv.write_text("12.11\n")
+        if family == "ubuntu":
+            real_osr.write_text(saved.replace('VERSION_ID="24.04"', 'VERSION_ID="22.04"').replace("noble", "jammy"))
+            label = "reject: unsupported distribution (Ubuntu 22.04)"
+        else:
+            real_osr.write_text(saved.replace('VERSION_ID="13"', 'VERSION_ID="12"').replace("trixie", "bookworm"))
+            dv.write_text("12.11\n")
+            label = "reject: unsupported distribution (Debian 12)"
         try:
             rc, out = ch.run([b + "/install.sh", "--preflight-only", "--target-user", USER])
-            record("reject: unsupported distribution (Debian 12)", rc != 0 and "mismatch" in out)
+            record(label, rc != 0 and ("mismatch" in out or "requires Debian" in out))
         finally:
             real_osr.write_text(saved)
             dv.write_text(dv_saved)
-        del osr_orig
 
-        for d in (hc, hw, hm):
+        if args.foreign_tarball:
+            ft = Path(args.foreign_tarball).resolve()
+            fname = ft.name[:-len(".tar.gz")]
+            shutil.copy2(ft, home / ft.name)
+            sh(["chroot", ch.root, "chown", "%s:%s" % (USER, USER), "/home/%s/%s" % (USER, ft.name)])
+            ch.run(["env", "-C", uhome, "tar", "-xzf", ft.name], user=USER)
+            rc, out = ch.run(["%s/%s/install.sh" % (uhome, fname), "--preflight-only", "--target-user", USER])
+            record("reject: bundle built for another distribution (%s)" % fname,
+                   rc != 0 and re.search(r"unsupported distribution|mismatch|MX Linux detected", out) is not None)
+            shutil.rmtree(home / fname)
+            (home / ft.name).unlink()
+
+        for d in (hc, hw, hm, hp):
             shutil.rmtree(d)
         record("no system changes from rejected runs",
                sha(ch.root / "var/lib/dpkg/status") == status_before)
+
+        # --- pip network fallback is impossible ----------------------------------
+        # A wheel removed so consistently that verify.sh passes, a hostile pip.conf
+        # and PIP_INDEX_URL: pip must fail offline (--no-index), never reach out.
+        pipconf = home / ".config/pip/pip.conf"
+        pipconf.parent.mkdir(parents=True, exist_ok=True)
+        pipconf.write_text("[global]\nindex-url = https://pypi.org/simple\nno-index = false\n")
+        sh(["chroot", ch.root, "chown", "-R", "%s:%s" % (USER, USER), "/home/%s/.config" % USER])
+        hf, fb = copy("pipfallback")
+        remove_wheel(hf, "idna", hide_from_closure=True)
+        vrc, _vout = ch.run([fb + "/verify.sh"], user=USER)
+        if args.use_sudo:
+            rc, out = ch.run(["sudo", fb + "/install.sh", "--yes"], user=USER, env={"PIP_INDEX_URL": "https://pypi.org/simple"})
+        else:
+            rc, out = ch.run([fb + "/install.sh", "--yes"], env={"SUDO_USER": USER, "PIP_INDEX_URL": "https://pypi.org/simple"})
+        marker = home / ".venvs/madd-python/.madd-python-bundle"
+        record("pip network fallback impossible (missing wheel, hostile pip.conf, no network)",
+               vrc == 0 and rc != 0 and re.search(r"No matching distribution found for idna|Could not find a version that "
+                                                  r"satisfies the requirement idna", out) is not None
+               and not re.search(r"NewConnectionError|Retrying \(|Max retries exceeded", out)
+               and marker.is_file() and "status=incomplete" in marker.read_text())
+        shutil.rmtree(hf)
 
         # --- real installation ------------------------------------------------
         env = {}
@@ -222,7 +298,8 @@ def main():
         else:
             rc, out = ch.run([b + "/install.sh", "--yes"], env=dict(env, SUDO_USER=USER))
         Path("/var/tmp/madd-test/install-%s.log" % ch.root.name).write_text(out)
-        record("install: offline install.sh (no network namespace)", rc == 0 and "smoke tests: PASS" in out,
+        record("install: offline install.sh (no network namespace), recovers from failed pip step",
+               rc == 0 and "smoke tests: PASS" in out and "status=complete" in marker.read_text(),
                (re.search(r"simulation OK.*", out) or [""])[0])
         if rc != 0:
             print(out[-6000:])

@@ -1,96 +1,38 @@
 # Full_python_pip_plus_bundle
 
-Offline Python development bundle builder for MX Linux. It builds one archive,
-`madd-python-full-mx25-amd64.tar.gz`. You copy that archive to an air-gapped
-MX Linux 25 (Debian 13 "trixie") amd64 machine, verify it, and install it with
-no network access. The archive contains:
+This builds an offline Python development bundle from Termux on an Android
+phone. The bundle is installed on an air-gapped x86_64 laptop running
+MX Linux 25 (or Debian 13), or Ubuntu 24.04. The phone has Internet access;
+the laptop needs none.
 
-* Python 3.13 with pip, venv, Tkinter, and -dev headers
+Each bundle contains:
+
+* CPython with pip, venv, Tkinter (Tcl/Tk), and -dev headers
 * the native build toolchain
-* a complete hash-pinned wheelhouse: NumPy, SciPy, pandas, matplotlib,
-  cryptography, requests, pytest, and every dependency
-* manifests, checksums, a verifier, an installer, and smoke tests
+* every Debian/Ubuntu package these need, as a signed local repository
+* a complete hash-pinned wheelhouse: NumPy, SciPy, pandas, matplotlib, Pillow,
+  cryptography, PyNaCl, bcrypt, paramiko, requests, PyYAML, rich, pytest, and
+  every dependency
+* manifests, an inventory, a verifier, an installer, and smoke tests
 
 No Bluetooth, Wi-Fi, cellular, or other radio software is bundled. Every build
 audits for this.
 
-## How it fits together
-
-    Android phone (Termux)                        Air-gapped MX 25 laptop (amd64)
-    ----------------------                        -------------------------------
-    build_madd_python_bundle.sh                   ./verify.sh
-      └─ proot-distro ubuntu-claude-secure        sudo ./install.sh
-           └─ builder/stage.sh                      ├─ preflight (no changes)
-                └─ builder/madd_stage.py            ├─ APT from bundled file: repo only
-                     ├─ isolated APT (amd64)        ├─ ~/.venvs/madd-python (pip --no-index)
-                     ├─ pip download (x86_64 tags)  └─ smoke tests
-                     ├─ audits + offline tests
-                     └─ output/dist/*.tar.gz  ──USB──▶
-
-* Termux is never the build target. All staging work runs inside the existing
-  `ubuntu-claude-secure` proot-distro environment. Both the 4.x layout
-  (`installed-rootfs/`) and the 5.x layout (`containers/`) are detected.
-* The phone is ARM64. Target artifacts are always requested explicitly:
-  Debian packages via an isolated APT instance with `APT::Architecture
-  "amd64"`, and wheels via `pip download --platform manylinux_*_x86_64
-  --python-version 3.13 --abi cp313`. Every wheel's tags and every .deb's
-  architecture are checked afterwards.
-* The Python version, ABI, and glibc baseline are read from the resolved
-  Debian packages (python3, libc6). They are not hard-coded.
-* Nothing in the build needs root. Root inside proot is only used if you ask
-  for `--install-staging-prereqs`.
-
-## Building (on the phone)
+## Quick start (phone)
 
     # once, in Termux:
-    pkg install proot-distro
-    # this repository inside Termux's home, then:
-    ./build_madd_python_bundle.sh --install-staging-prereqs     # first run
-    ./build_madd_python_bundle.sh                               # later runs
+    pkg install python shellcheck proot-distro
+    # in the project directory:
+    ./build_madd_python_bundle.sh                      # MX Linux 25 / Debian 13 bundle
+    ./build_madd_python_bundle.sh --profile ubuntu2404-amd64   # Ubuntu 24.04 bundle
 
-`--install-staging-prereqs` runs `apt-get update` and installs python3,
-python3-venv, gpgv, ca-certificates, debian-archive-keyring, and shellcheck
-*inside ubuntu-claude-secure only*. Without it the builder lists exactly what
-is missing.
+The first run may need `--install-staging-prereqs`. In Termux it installs
+missing builder tools with `pkg`. Inside `ubuntu-claude-secure` it installs
+python3, gpgv, ca-certificates, and the archive keyring with `apt-get`.
+`--preflight-only` checks everything and builds nothing.
 
-Needs about 4 GiB free (checked; change it with `--min-free-gb`). Downloads
-are cached in `output/cache/`, so reruns are fast. Every run builds in a fresh
-`output/staging.*` directory. The previous archive in `output/dist/` is
-replaced only after the new one has passed every build-time test.
-
-On a Debian/Ubuntu Linux machine you can build without Termux:
-`./build_madd_python_bundle.sh --staging local`.
-
-### Matching the laptop exactly (recommended)
-
-An air-gapped laptop may be missing months of updates. Some bundled packages
-need newer versions of base libraries that are already installed, for example
-the util-linux family or libc. By default the builder covers this by modelling
-an un-updated MX 25 / Debian 13.0 machine from the signed Debian 13.0 release
-index (snapshot.debian.org). It adds the base packages that machine would have
-to upgrade in lockstep.
-
-For an exact match, export the laptop's package state and build against it:
-
-    # on the MX laptop (no root, no network, read-only):
-    ./export-target-state.sh /media/usb/mx-target-state
-    # on the phone:
-    ./build_madd_python_bundle.sh --target-state /path/to/mx-target-state
-
-`export-target-state.sh` is included in every bundle and in
-`bundle_template/`. It copies `/var/lib/dpkg/status`, os-release, the
-architecture, and the MX version. No user files are copied.
-
-### Outputs (`output/dist/`)
-
-| File | Purpose |
-|------|---------|
-| madd-python-full-mx25-amd64.tar.gz | the bundle |
-| madd-python-full-mx25-amd64.tar.gz.sha256 | archive checksum; copy it with the archive |
-| madd-python-full-mx25-amd64.build-report.txt | every build test with PASS/FAIL, plus BUILD_INFO |
-| madd-python-full-mx25-amd64.wireless-audit.txt | what the exclusion audit checked and found |
-
-## Installing (on the MX laptop)
+The result is in `output/dist/`. Copy the `.tar.gz` and its `.sha256` to the
+laptop, then:
 
     sha256sum -c madd-python-full-mx25-amd64.tar.gz.sha256
     tar -xzf madd-python-full-mx25-amd64.tar.gz
@@ -98,71 +40,134 @@ architecture, and the MX version. No user files are copied.
     ./verify.sh
     sudo ./install.sh
 
-The bundle's own README.md covers the details: options, what is and is not
-changed, removal, and troubleshooting.
+## Where each stage runs
 
-## What the build checks
+    Termux (native, preferred)                     ubuntu-claude-secure (proot)
+    -------------------------------------------    ------------------------------
+    build_madd_python_bundle.sh
+      detect environment + builder/target arch
+      prerequisite gates (ShellCheck mandatory)
+      builder/madd_stage.py
+        private tools venv (hash-pinned pip)
+        APT stage ───── proot-distro login ──────▶  builder/stage.sh
+                                                     builder/madd_debstage.py
+                                                       resolve + download .debs
+                                                       (APT::Architecture amd64)
+        ◀──── signed repo slice + JSON ───────────     offline APT self-tests
+        re-verify every hand-off file
+        target wheelhouse (pip download with explicit
+          --platform manylinux_*_x86_64 --abi cp3XX)
+        dependency closure with target markers
+        manifests, inventory, wireless audit
+        ShellCheck, offline pip test, SHA256SUMS
+        tar.gz + extraction/tamper self-tests
+      output/dist/<bundle>.tar.gz (+ .sha256)
 
-Every build records these in the build report and stops on any failure:
+* Only the Debian/Ubuntu package stage uses Ubuntu. It needs APT to resolve
+  dependencies and to verify the archive signatures.
+* Downloading wheels, hashing, building manifests, auditing, ShellCheck, and
+  archiving all run directly in Termux.
+* On a Debian/Ubuntu host, or inside the proot environment itself, every
+  stage runs locally.
+* Builder architecture (for example the phone's aarch64) and target
+  architecture (amd64/x86_64) are kept separate. Every artifact is requested
+  explicitly for the target, and every .deb architecture and wheel tag is
+  checked afterwards. Nothing built for the target is executed on the builder.
+  Both architectures are recorded in BUILD_INFO.txt and inventory.txt.
+* The proot-distro 4.x and 5.x layouts are both supported. The default
+  environment name is `ubuntu-claude-secure` (`--distro NAME` to change).
 
-* Every .deb matches the SHA-256 and size in Debian's signed index (APT
-  verifies the InRelease signatures; nothing disables that).
-* Every .deb is amd64 or all. Every wheel's tags fit CPython 3.13 / cp313 /
-  manylinux x86_64.
-* Wheel dependency closure is evaluated with the target's environment markers
-  (python_version 3.13, platform_machine x86_64, ...). It does not use the
-  phone's own markers.
-* Wireless / Bluetooth / cellular audit. It checks Debian package names,
-  relationship fields, descriptions, every file path inside every .deb, Python
-  project names, all Requires-Dist entries (including optional extras),
-  summaries and classifiers, and top-level modules. Reviewed exceptions live in
-  `builder/wireless-allowlist.txt`, each with a written reason, and each one
-  is listed individually in the report. Currently there is one: kernel UAPI C
-  headers in linux-libc-dev, such as `rfkill.h` and `nl80211.h`. libc6-dev
-  requires them, and they are header files only.
-* Static checks: `bash -n`, zero backticks, shellcheck, Python syntax, and no
-  `shell=True`.
-* Offline resolution from the bundled local repository alone: for an empty
-  system, for every bundled package, for both un-updated-machine models, and
-  for `--target-state` when given. Offline hash-checked resolution of
-  requirements.lock.
-* Clean extraction of the final tar.gz. verify.sh must pass, must reject a
-  modified file, and must reject a missing file.
+## Trust chain
+
+* Debian/Ubuntu packages are resolved by an isolated APT instance from the
+  official HTTPS mirrors. APT verifies the InRelease signatures with the
+  archive keyring, and every .deb is matched against the SHA-256 in that
+  signed index.
+* The bundle ships the signed InRelease and Packages.xz files unchanged.
+  Packages.xz is checked against InRelease. Only the bundled .deb files are
+  included.
+* On the laptop, APT verifies those signatures with the laptop's own
+  installed archive keyring. There is no `trusted=yes`. Pins and a check of
+  APT's plan restrict installation to exactly the bundled versions.
+* Wheels come from PyPI over HTTPS. They are locked with SHA-256
+  (`requirements.lock`) and installed with
+  `pip install --no-index --require-hashes`. pip cannot fall back to the
+  network: `--no-index` is passed, pip configuration and environment are
+  ignored (`--isolated`, `env -i`), and proxies point to an unreachable
+  address.
+* The builder's own tools (pip, packaging) are hash-pinned in
+  `builder/tools-requirements.txt`.
+* Exception: the archive's Valid-Until date (a freshness check, normally 7
+  days for the -updates and -security suites) is not enforced for the bundled
+  local sources. An offline snapshot is always used after that date.
+  Signature and hash checks stay on.
+
+## Un-updated laptops
+
+An air-gapped laptop may be missing months of updates. Some bundled packages
+then need newer versions of installed base libraries, such as libc or the
+util-linux family. The builder models an un-updated machine from the signed
+release-time index. For Debian 13.0 that is snapshot.debian.org; for Ubuntu it
+is the frozen `noble` pocket. It bundles exactly the base packages such a
+machine would have to upgrade.
+
+For an exact match, run `./export-target-state.sh DIR` on the laptop (no root,
+no network, read-only; included in every bundle). Carry DIR to the phone and
+build with `--target-state DIR`.
+
+## Outputs (`output/dist/`)
+
+| File | Purpose |
+|------|---------|
+| `<bundle>.tar.gz` | the bundle |
+| `<bundle>.tar.gz.sha256` | archive checksum; copy it with the archive |
+| `<bundle>.build-report.txt` | every build test with PASS/FAIL, plus BUILD_INFO |
+| `<bundle>.inventory.txt` | target/builder facts and every package with its SHA-256 |
+| `<bundle>.wireless-audit.txt` | what the exclusion audit checked and found |
+
+A previous bundle is replaced only after the new one has passed every
+build-time test. Every mandatory test must PASS; any FAIL or SKIP stops the
+release. Downloads are cached in `output/cache/`.
 
 ## Repository layout
 
-    build_madd_python_bundle.sh   entry point (Termux -> proot, or --staging local)
+    build_madd_python_bundle.sh   the entry point (Termux, Ubuntu proot, or Debian/Ubuntu host)
     builder/
-      stage.sh                    runs inside the staging environment
-      madd_stage.py               resolution, download, audits, manifests, tests, archive
-      profiles/mx25-amd64.conf    target profile (key=value; parsed, never sourced)
-      debian-packages.txt         requested Debian packages
+      madd_stage.py               orchestrator (runs natively in Termux)
+      madd_debstage.py            APT stage (stdlib only; local or inside proot)
+      madd_common.py              shared helpers
+      stage.sh                    APT-stage entry and prerequisite check
+      profiles/*.conf             targets: mx25-amd64, ubuntu2404-amd64
+      debian-packages.txt         requested system packages
       requirements.in             requested Python packages
       sdist-fallback.txt          packages to bundle as source (empty: all have wheels)
       wireless-allowlist.txt      reviewed audit exceptions with reasons
-      tools-requirements.txt      hash-pinned staging tools (pip, packaging)
+      tools-requirements.txt      hash-pinned builder tools
     bundle_template/              files copied into every bundle
       install.sh verify.sh uninstall-user-env.sh export-target-state.sh README.md
       scripts/smoke_test.py scripts/verify_python.py
     tests/
-      test_install_chroot.py      installer tests in a disposable Debian 13 chroot
+      test_builder_prereqs.py     entry point, environment detection, ShellCheck gate
+      test_install_chroot.py      offline install tests in a disposable chroot
       fake-proot-distro           proot-distro stand-in for testing the Termux path
 
-Another target (for example arm64) would need a new profile in
-`builder/profiles/`. The builder takes the Debian architecture and wheel
-platform from the profile.
+## Testing
 
-## Testing the installer
-
-`tests/test_install_chroot.py` runs as root on a Linux test host, against a
-chroot made with mmdebstrap. It runs the installer inside `unshare -n`, a
-network namespace with no network at all. It covers:
-
-* verify and preflight
-* rejection of a corrupted file, the wrong architecture, a missing dependency,
-  the wrong distribution, and a foreign venv
-* a real installation and the smoke tests
-* launchers and PEP 668
-* rerun idempotency, uninstall, and a `--skip-system` rebuild
-
-See the script header for setup.
+* `python3 tests/test_builder_prereqs.py -v` covers:
+  * environment detection and where each stage runs;
+  * the ShellCheck gate (missing ShellCheck stops the build; it is never
+    skipped);
+  * `--target-arch` checks;
+  * `--install-staging-prereqs`.
+* `tests/test_install_chroot.py --rootfs DIR --tarball FILE [--use-sudo] [--gui] [--foreign-tarball FILE]`
+  runs as root on a Linux test host, against a disposable chroot made with
+  mmdebstrap. The installer runs in `unshare -n` (no network at all). It
+  covers:
+  * verify and preflight;
+  * rejection of a corrupted file, a missing .deb, a missing mandatory wheel,
+    the wrong architecture, the wrong distribution, and a bundle for another
+    distribution;
+  * pip network fallback being impossible;
+  * a real installation, Tkinter (including a real Tk window under Xvfb), and
+    the import/functional smoke tests;
+  * launchers, PEP 668, rerun, recovery, and uninstall.
