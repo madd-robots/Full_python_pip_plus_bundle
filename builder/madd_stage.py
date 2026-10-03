@@ -1043,13 +1043,15 @@ class Builder:
                 problems.append("backtick in %s" % sh.name)
         self.record("static: bash -n and zero backticks", not problems,
                     "; ".join(problems) or "%d shell scripts" % len(shells))
-        if shutil.which("shellcheck"):
-            proc = run(["shellcheck", "-x", "-S", "warning", *shells], check=False, capture=True)
-            if proc.stdout:
-                print(proc.stdout, flush=True)
-            self.record("static: shellcheck (warning level)", proc.returncode == 0, "")
-        else:
-            self.results.append(("static: shellcheck", "SKIP", "shellcheck not installed in staging"))
+        # ShellCheck is a required release check: a missing binary fails the build.
+        if not shutil.which("shellcheck"):
+            self.record("static: shellcheck (warning level)", False,
+                        "shellcheck not installed in staging; install it (apt-get install shellcheck) "
+                        "or rerun with --install-staging-prereqs")
+        proc = run(["shellcheck", "-x", "-S", "warning", *shells], check=False, capture=True)
+        if proc.stdout:
+            print(proc.stdout, flush=True)
+        self.record("static: shellcheck (warning level)", proc.returncode == 0, "")
         pys = sorted(self.bundle_dir.rglob("*.py"))
         bad = []
         for py in pys:

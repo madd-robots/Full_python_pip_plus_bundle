@@ -37,7 +37,7 @@ for cmd in apt-get dpkg-deb; do
 done
 
 missing=()
-for cmd in python3 tar gzip sha256sum find; do
+for cmd in python3 tar gzip sha256sum find shellcheck; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 if ! command -v gpgv >/dev/null 2>&1 && ! command -v sqv >/dev/null 2>&1; then
@@ -48,7 +48,7 @@ if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import venv, ensurepip' >/dev/null 2>&1 || missing+=(python3-venv)
 fi
 
-if [ "${#missing[@]}" -gt 0 ] || { [ "$INSTALL_PREREQS" -eq 1 ] && ! command -v shellcheck >/dev/null 2>&1; }; then
+if [ "${#missing[@]}" -gt 0 ]; then
     if [ "$INSTALL_PREREQS" -ne 1 ]; then
         say "missing staging prerequisites: ${missing[*]}"
         say "install them inside the staging environment with:"
