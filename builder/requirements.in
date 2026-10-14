@@ -1,0 +1,69 @@
+# Top-level Python packages for the offline wheelhouse.
+# Versions are resolved at build time and frozen in requirements.lock.
+
+# Packaging and environment tools
+pip
+setuptools
+wheel
+virtualenv
+packaging
+build
+pip-tools
+setuptools-scm
+platformdirs
+filelock
+
+# Scientific / numeric / data
+numpy
+scipy
+pandas
+matplotlib
+Pillow
+
+# Cryptography and security programming
+cryptography
+cffi
+pycparser
+pyOpenSSL
+bcrypt
+PyNaCl
+argon2-cffi
+pycryptodome
+paramiko
+
+# HTTP / networking programming (general APIs, not radio management)
+requests
+urllib3
+certifi
+charset-normalizer
+idna
+httpx
+
+# File formats / configuration / serialization
+PyYAML
+tomlkit
+jsonschema
+Jinja2
+python-dateutil
+typing-extensions
+python-dotenv
+# tomllib is in the stdlib from Python 3.11; tomli only for older targets
+tomli; python_version < "3.11"
+
+# System / CLI utilities
+psutil
+rich
+typer
+click
+tqdm
+watchdog
+
+# Development and testing
+pytest
+pytest-cov
+ruff
+black
+mypy
+
+# Hardware development (USB/UART serial)
+pyserial

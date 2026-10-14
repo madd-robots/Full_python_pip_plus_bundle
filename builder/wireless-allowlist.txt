@@ -1,0 +1,6 @@
+# Reviewed exceptions for the wireless/Bluetooth/cellular exclusion audit.
+# Format: KIND NAME REGEX  # reason (mandatory)
+# REGEX is matched against the audit finding text; keep it as narrow as possible.
+# Every allowlisted finding is still listed individually in wireless-audit.txt.
+
+deb linux-libc-dev ^path\s\./usr/include/ # Linux kernel userspace-API C headers, required by libc6-dev to compile any C code; header files only (no drivers, firmware, modules, daemons or tools)

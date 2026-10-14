@@ -1,0 +1,8 @@
+# Packages that must be bundled as verified source distributions because no
+# compatible wheel exists for the target. One project per line: NAME [manual-deps]
+# ('manual-deps' = its runtime dependencies were added to requirements.in by hand
+# because the sdist does not declare static dependency metadata).
+# Empty by default: every package in requirements.in currently resolves to a
+# target-compatible wheel. If the builder reports a package without a wheel,
+# add it here and rebuild; its build requirements are then added to the
+# wheelhouse and the native headers it needs must be in debian-packages.txt.
